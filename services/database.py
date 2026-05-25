@@ -52,6 +52,57 @@ async def update_admin_password(admin_id: int, new_password: str):
     await execute("UPDATE admin_users SET password_hash=$1 WHERE id=$2",
                   hash_password(new_password), admin_id)
 
+# Known broken hash from older migration.sql seed — sha256("123")
+# It will never verify under sha256(salt||pw), so we auto-repair it on startup.
+_BROKEN_ADMIN_HASH = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3:defaultsalt"
+
+async def ensure_admin_seed(default_username: str = "admin", default_password: str = "admin123"):
+    """
+    Boot-time self-heal for the master admin login.
+
+    1. Make sure the admin_users table exists (in case migration.sql wasn't run).
+    2. If no admin user exists at all, create one with default credentials.
+    3. If the existing admin still has the known-broken seed hash, repair it.
+       Rows that have been changed by the user are left untouched.
+    """
+    try:
+        await execute("""
+            CREATE TABLE IF NOT EXISTS admin_users (
+                id            SERIAL PRIMARY KEY,
+                username      VARCHAR(60)  NOT NULL UNIQUE,
+                password_hash VARCHAR(300) NOT NULL,
+                name          VARCHAR(100) DEFAULT 'Admin',
+                is_active     BOOLEAN DEFAULT TRUE,
+                created_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+
+        row = await fetchrow("SELECT id, password_hash FROM admin_users WHERE username=$1", default_username)
+        if not row:
+            await execute(
+                "INSERT INTO admin_users (username, password_hash, name) VALUES ($1, $2, 'Super Admin')",
+                default_username, hash_password(default_password),
+            )
+            logger.warning(
+                "Seeded default admin user '%s' with password '%s'. CHANGE IT AFTER LOGIN.",
+                default_username, default_password,
+            )
+            return
+
+        if row["password_hash"] == _BROKEN_ADMIN_HASH:
+            await execute(
+                "UPDATE admin_users SET password_hash=$1 WHERE id=$2",
+                hash_password(default_password), row["id"],
+            )
+            logger.warning(
+                "Detected broken admin password seed; reset '%s' to default password '%s'. "
+                "CHANGE IT AFTER LOGIN.",
+                default_username, default_password,
+            )
+    except Exception as e:
+        # Never block startup over the seed; just log it loudly.
+        logger.exception("ensure_admin_seed failed: %s", e)
+
 # ══════════════════════════════════════════════════════════════════
 # HOTELS
 # ══════════════════════════════════════════════════════════════════

@@ -146,10 +146,13 @@ CREATE INDEX IF NOT EXISTS idx_sr_status          ON service_requests(status);
 
 -- ── 6. Seed master admin (change password after first login!) ─────
 -- Default: admin / admin123  ← CHANGE THIS IMMEDIATELY
+-- Hash format expected by services/auth.py:verify_password():
+--   sha256(salt || password)  stored as  "<hex_hash>:<salt>"
+-- Below: salt = 'defaultsalt', password = 'admin123'
 INSERT INTO admin_users (username, password_hash, name)
 VALUES (
     'admin',
-    'a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3:defaultsalt',
+    '86908ee61ea114e1728cf0613c977cb70a5f2a73b56e4db9990a4fab8561ae92:defaultsalt',
     'Super Admin'
 ) ON CONFLICT (username) DO NOTHING;
 
