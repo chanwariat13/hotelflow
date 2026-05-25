@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>HotelFlow — Login</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Outfit',sans-serif;background:#0d1117;color:#e6edf3;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:36px 32px;width:100%;max-width:420px;}
+.logo{text-align:center;margin-bottom:28px;}
+.logo h1{font-family:'Playfair Display',serif;color:#c8a84b;font-size:26px;}
+.logo p{color:#8b949e;font-size:13px;margin-top:4px;}
+.tabs{display:flex;gap:0;border:1px solid #30363d;border-radius:8px;overflow:hidden;margin-bottom:24px;}
+.tab{flex:1;padding:9px;text-align:center;cursor:pointer;font-size:13px;color:#8b949e;background:transparent;border:none;font-family:'Outfit',sans-serif;transition:all .15s;}
+.tab.on{background:#c8a84b;color:#0d1117;font-weight:600;}
+.fg{display:flex;flex-direction:column;gap:4px;margin-bottom:14px;}
+.fg label{font-size:12px;color:#8b949e;}
+.fg input,.fg select{background:#1c2128;border:1px solid #30363d;color:#e6edf3;padding:10px 12px;border-radius:8px;font-size:14px;font-family:'Outfit',sans-serif;transition:border .15s;}
+.fg input:focus,.fg select:focus{outline:none;border-color:#c8a84b;}
+.btn{width:100%;padding:12px;background:#c8a84b;color:#0d1117;font-size:15px;font-weight:700;border:none;border-radius:8px;cursor:pointer;font-family:'Outfit',sans-serif;margin-top:6px;transition:opacity .15s;}
+.btn:hover{opacity:.9;}.btn:disabled{opacity:.5;cursor:not-allowed;}
+.err{background:rgba(218,54,51,.15);border:1px solid rgba(218,54,51,.3);color:#f85149;border-radius:6px;padding:10px;font-size:13px;margin-top:10px;display:none;}
+.note{font-size:12px;color:#8b949e;text-align:center;margin-top:14px;}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <h1>🏨 HotelFlow</h1>
+    <p>Hotel Management System</p>
+  </div>
+  <div class="tabs">
+    <button class="tab on" id="tab-admin" onclick="setTab('admin')">Super Admin</button>
+    <button class="tab" id="tab-hotel" onclick="setTab('hotel')">Hotel Login</button>
+  </div>
+
+  <!-- Admin Login -->
+  <div id="adminForm">
+    <div class="fg"><label>Username</label><input type="text" id="aUser" placeholder="admin"></div>
+    <div class="fg"><label>Password</label><input type="password" id="aPass" placeholder="••••••••" onkeydown="if(event.key==='Enter')adminLogin()"></div>
+    <button class="btn" onclick="adminLogin()" id="aBtn">Login as Admin</button>
+    <div class="err" id="aErr"></div>
+  </div>
+
+  <!-- Hotel Login -->
+  <div id="hotelForm" style="display:none">
+    <div class="fg"><label>Hotel Slug</label><input type="text" id="hSlug" placeholder="grand-stay"></div>
+    <div class="fg"><label>Username</label><input type="text" id="hUser" placeholder="owner / manager / staff_name"></div>
+    <div class="fg"><label>Password</label><input type="password" id="hPass" placeholder="••••••••" onkeydown="if(event.key==='Enter')hotelLogin()"></div>
+    <button class="btn" onclick="hotelLogin()" id="hBtn">Login to Dashboard</button>
+    <div class="err" id="hErr"></div>
+  </div>
+
+  <div class="note">🔒 Secure login · HotelFlow v2</div>
+</div>
+<script>
+function setTab(t){
+  document.getElementById('adminForm').style.display=t==='admin'?'block':'none';
+  document.getElementById('hotelForm').style.display=t==='hotel'?'block':'none';
+  document.getElementById('tab-admin').classList.toggle('on',t==='admin');
+  document.getElementById('tab-hotel').classList.toggle('on',t==='hotel');
+}
+async function adminLogin(){
+  const u=document.getElementById('aUser').value.trim();
+  const p=document.getElementById('aPass').value;
+  const btn=document.getElementById('aBtn');const err=document.getElementById('aErr');
+  if(!u||!p){err.style.display='block';err.textContent='Enter username and password';return;}
+  btn.disabled=true;btn.textContent='Logging in...';err.style.display='none';
+  try{
+    const r=await fetch('/auth/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const d=await r.json();
+    if(d.success){window.location.href='/admin';}
+    else{err.style.display='block';err.textContent=d.error||'Invalid credentials';btn.disabled=false;btn.textContent='Login as Admin';}
+  }catch(e){err.style.display='block';err.textContent='Network error';btn.disabled=false;btn.textContent='Login as Admin';}
+}
+async function hotelLogin(){
+  const slug=document.getElementById('hSlug').value.trim().toLowerCase();
+  const u=document.getElementById('hUser').value.trim();
+  const p=document.getElementById('hPass').value;
+  const btn=document.getElementById('hBtn');const err=document.getElementById('hErr');
+  if(!slug||!u||!p){err.style.display='block';err.textContent='Fill all fields';return;}
+  btn.disabled=true;btn.textContent='Logging in...';err.style.display='none';
+  try{
+    const r=await fetch(`/auth/hotel/${slug}/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const d=await r.json();
+    if(d.success){window.location.href=`/hotel/${slug}`;}
+    else{err.style.display='block';err.textContent=d.error||'Invalid credentials';btn.disabled=false;btn.textContent='Login to Dashboard';}
+  }catch(e){err.style.display='block';err.textContent='Network error';btn.disabled=false;btn.textContent='Login to Dashboard';}
+}
+// Pre-fill slug from URL
+const sp=new URLSearchParams(window.location.search);
+if(sp.get('slug')){document.getElementById('hSlug').value=sp.get('slug');setTab('hotel');}
+if(sp.get('role')==='admin')setTab('admin');
+</script>
+</body>
+</html>

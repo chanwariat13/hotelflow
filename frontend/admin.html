@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>HotelFlow — Master Admin</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600;700&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0d1117;--sf:#161b22;--s2:#1c2128;--bd:#30363d;--gd:#c8a84b;--tx:#e6edf3;--t2:#8b949e;--r:8px;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;display:flex;}
+h1,h2,h3{font-family:'Playfair Display',serif;}
+.sb{width:215px;background:var(--sf);border-right:1px solid var(--bd);position:fixed;height:100vh;overflow-y:auto;display:flex;flex-direction:column;z-index:50;}
+.brand{padding:18px 16px;border-bottom:1px solid var(--bd);text-align:center;}
+.brand h2{color:var(--gd);font-size:18px;font-family:'Playfair Display',serif;}
+.brand p{color:var(--t2);font-size:11px;margin-top:3px;}
+.slbl{padding:12px 14px 3px;color:var(--t2);font-size:10px;text-transform:uppercase;letter-spacing:1px;font-weight:600;}
+.ni{display:flex;align-items:center;gap:8px;padding:9px 14px;cursor:pointer;color:var(--t2);font-size:13px;border-left:3px solid transparent;transition:all .15s;}
+.ni:hover{background:var(--s2);color:var(--tx);}
+.ni.on{background:rgba(200,168,75,.12);color:var(--gd);border-left-color:var(--gd);}
+.sb-ft{margin-top:auto;padding:12px 14px;border-top:1px solid var(--bd);}
+.main{margin-left:215px;flex:1;padding:22px;}
+.pg{display:none;}.pg.on{display:block;}
+.ptitle{font-size:22px;color:var(--gd);margin-bottom:18px;font-family:'Playfair Display',serif;}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(165px,1fr));gap:13px;margin-bottom:22px;}
+.card{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);padding:15px;}
+.cl{font-size:11px;color:var(--t2);text-transform:uppercase;letter-spacing:.4px;}
+.cv{font-size:24px;font-weight:700;margin:5px 0 2px;}
+.cs{font-size:11px;color:var(--t2);}
+.gld{color:var(--gd);}.grn{color:#3fb950;}.red{color:#f85149;}
+.tw{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);overflow:auto;}
+table{width:100%;border-collapse:collapse;}
+th{background:var(--s2);padding:9px 12px;text-align:left;font-size:11px;text-transform:uppercase;color:var(--t2);border-bottom:1px solid var(--bd);white-space:nowrap;}
+td{padding:9px 12px;border-bottom:1px solid var(--bd);font-size:13px;vertical-align:middle;}
+tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02);}
+.btn{display:inline-flex;align-items:center;gap:5px;padding:7px 13px;border-radius:var(--r);font-size:13px;cursor:pointer;border:none;font-family:'Outfit',sans-serif;font-weight:500;transition:all .15s;}
+.bg{background:var(--gd);color:#0d1117;}.bg:hover{opacity:.9;}
+.bsm{padding:4px 9px;font-size:12px;}
+.bgh{background:transparent;border:1px solid var(--bd);color:var(--t2);}.bgh:hover{border-color:var(--gd);color:var(--gd);}
+.brd{background:rgba(218,54,51,.15);border:1px solid rgba(218,54,51,.3);color:#f85149;}
+.bgn{background:rgba(35,134,54,.15);border:1px solid rgba(35,134,54,.3);color:#3fb950;}
+.bdg{display:inline-block;padding:2px 7px;border-radius:3px;font-size:11px;font-weight:600;}
+.ba{background:rgba(35,134,54,.2);color:#3fb950;}.bc{background:rgba(31,111,235,.15);color:#79c0ff;}
+.bo{background:rgba(218,54,51,.15);color:#f85149;}
+.fsec{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);padding:18px;margin-bottom:14px;}
+.ft{font-size:13px;color:var(--gd);font-weight:600;margin-bottom:12px;padding-bottom:7px;border-bottom:1px solid var(--bd);}
+.fg{display:flex;flex-direction:column;gap:4px;margin-bottom:12px;}
+.fg label{font-size:12px;color:var(--t2);font-weight:500;}
+.fg input,.fg select,.fg textarea{background:var(--s2);border:1px solid var(--bd);color:var(--tx);padding:8px 10px;border-radius:var(--r);font-size:13px;font-family:'Outfit',sans-serif;transition:border .15s;width:100%;}
+.fg input:focus,.fg select:focus{outline:none;border-color:var(--gd);}
+.fgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;}
+.tag{display:inline-block;background:rgba(200,168,75,.1);border:1px solid rgba(200,168,75,.25);color:var(--gd);border-radius:3px;padding:1px 7px;font-size:11px;}
+.dv{border:none;border-top:1px solid var(--bd);margin:12px 0;}
+.ov{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:500;display:none;align-items:center;justify-content:center;}
+.ov.open{display:flex;}
+.modal{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);padding:22px;max-width:520px;width:94%;max-height:84vh;overflow-y:auto;}
+.mt{font-size:15px;color:var(--gd);margin-bottom:13px;font-family:'Playfair Display',serif;}
+.toast{position:fixed;bottom:20px;right:20px;background:var(--s2);border:1px solid var(--bd);border-radius:var(--r);padding:11px 18px;font-size:13px;z-index:9999;transition:all .3s;transform:translateY(70px);opacity:0;}
+.toast.show{transform:translateY(0);opacity:1;}
+.tok{border-color:#238636;color:#3fb950;}.ter{border-color:#da3633;color:#f85149;}
+.ti{background:var(--s2);border:1px solid var(--bd);color:var(--tx);padding:7px 10px;border-radius:var(--r);font-size:13px;font-family:'Outfit',sans-serif;}
+.ti:focus{outline:none;border-color:var(--gd);}
+.hotel-card{background:var(--sf);border:1px solid var(--bd);border-radius:var(--r);padding:16px;margin-bottom:12px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;}
+.hotel-card:hover{border-color:var(--gd);}
+.add-row{color:var(--gd);background:transparent;border:1px dashed var(--gd);border-radius:var(--r);padding:6px 13px;cursor:pointer;font-size:12px;font-family:'Outfit',sans-serif;width:100%;margin-top:5px;}
+.add-row:hover{background:rgba(200,168,75,.1);}
+.dr{display:flex;gap:7px;align-items:center;margin-bottom:7px;}
+.dr input,.dr select{flex:1;background:var(--s2);border:1px solid var(--bd);color:var(--tx);padding:7px 9px;border-radius:var(--r);font-size:13px;font-family:'Outfit',sans-serif;}
+</style>
+</head>
+<body>
+<aside class="sb">
+  <div class="brand"><h2>🏨 HotelFlow</h2><p>Master Admin Panel</p></div>
+  <div class="slbl">Overview</div>
+  <div class="ni on" onclick="nav('dash')">📊 Master Dashboard</div>
+  <div class="ni" onclick="nav('hotels')">🏨 All Hotels</div>
+  <div class="ni" onclick="nav('bk')">📋 All Bookings</div>
+  <div class="slbl">Hotel Management</div>
+  <div class="ni" onclick="nav('add')">➕ Add New Hotel</div>
+  <div class="slbl">Account</div>
+  <div class="ni" onclick="nav('pw')">🔑 Change Password</div>
+  <div class="sb-ft">
+    <div style="font-size:13px;font-weight:500;margin-bottom:6px;color:var(--gd)">Super Admin</div>
+    <button class="btn bgh bsm" onclick="logout()" style="width:100%">🚪 Logout</button>
+  </div>
+</aside>
+
+<main class="main">
+
+<!-- MASTER DASHBOARD -->
+<div id="pg-dash" class="pg on">
+  <h2 class="ptitle">📊 Master Dashboard</h2>
+  <div class="cards">
+    <div class="card"><div class="cl">Active Hotels</div><div class="cv grn" id="mdAH">—</div><div class="cs" id="mdTH">of total</div></div>
+    <div class="card"><div class="cl">Total Guests Now</div><div class="cv gld" id="mdTG">—</div></div>
+    <div class="card"><div class="cl">Today Revenue (All)</div><div class="cv gld" id="mdRev">—</div></div>
+  </div>
+  <h3 style="font-size:15px;margin-bottom:12px;color:var(--t2)">Per-Hotel Snapshot</h3>
+  <div id="hotelSnap"><p style="color:var(--t2)">Loading...</p></div>
+</div>
+
+<!-- ALL HOTELS -->
+<div id="pg-hotels" class="pg">
+  <h2 class="ptitle">🏨 All Hotels</h2>
+  <div style="margin-bottom:14px"><button class="btn bg" onclick="nav('add')">➕ Add New Hotel</button></div>
+  <div id="hotelList"><p style="color:var(--t2)">Loading...</p></div>
+</div>
+
+<!-- ALL BOOKINGS -->
+<div id="pg-bk" class="pg">
+  <h2 class="ptitle">📋 All Bookings</h2>
+  <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+    <select class="ti" id="bkHotel" onchange="loadBk()" style="width:180px"><option value="">All Hotels</option></select>
+    <select class="ti" id="bkSt" onchange="loadBk()"><option value="">All Status</option><option value="Active">Active</option><option value="CheckedOut">Checked Out</option></select>
+    <button class="btn bgh bsm" onclick="loadBk()">↺</button>
+  </div>
+  <div class="tw"><table>
+    <thead><tr><th>Booking ID</th><th>Guest</th><th>Phone</th><th>Room</th><th>Hotel</th><th>Check-in</th><th>Check-out</th><th>Status</th><th>Balance</th></tr></thead>
+    <tbody id="bkTb"><tr><td colspan="9" style="text-align:center;color:var(--t2);padding:28px">Loading...</td></tr></tbody>
+  </table></div>
+</div>
+
+<!-- ADD NEW HOTEL -->
+<div id="pg-add" class="pg">
+  <h2 class="ptitle">➕ Add New Hotel Client</h2>
+  <form id="hForm" onsubmit="submitH(event)">
+
+  <div class="fsec"><div class="ft">Section 1 — Identity</div><div class="fgrid">
+    <div class="fg"><label>Hotel Name *</label><input required id="hName" placeholder="Grand Stay Hotel"></div>
+    <div class="fg"><label>Slug * (URL key)</label><input required id="hSlug" placeholder="grand-stay" oninput="this.value=this.value.toLowerCase().replace(/[^a-z0-9-]/g,'-')"><small style="color:var(--t2);font-size:11px">Guest pages: /register/grand-stay · /menu/grand-stay</small></div>
+    <div class="fg"><label>Evolution API Instance Name *</label><input required id="hInst" placeholder="GrandStayWA"></div>
+    <div class="fg"><label>Gotenberg PDF URL</label><input id="hGot" value="http://localhost:3000"></div>
+  </div></div>
+
+  <div class="fsec"><div class="ft">Section 2 — Branding</div><div class="fgrid">
+    <div class="fg"><label>Tagline</label><input id="hTag" placeholder="Your home away from home"></div>
+    <div class="fg"><label>Logo URL (Cloudinary)</label><input id="hLogo" placeholder="https://res.cloudinary.com/..."></div>
+    <div class="fg"><label>Primary Color</label><input type="color" id="hPC" value="#c8a84b" style="height:40px"></div>
+    <div class="fg"><label>Secondary Color</label><input type="color" id="hSC" value="#1a2942" style="height:40px"></div>
+    <div class="fg"><label>Background Color</label><input type="color" id="hBC" value="#0d1117" style="height:40px"></div>
+    <div class="fg"><label>Button Color</label><input type="color" id="hBTC" value="#c8a84b" style="height:40px"></div>
+    <div class="fg"><label>Font</label><select id="hFont"><option>Outfit</option><option>Poppins</option><option>Roboto</option><option>Lato</option><option>Nunito</option></select></div>
+  </div></div>
+
+  <div class="fsec"><div class="ft">Section 3 — Hotel Info (shown to guests)</div><div class="fgrid">
+    <div class="fg"><label>Address</label><input id="hAddr" placeholder="123 Hotel Road"></div>
+    <div class="fg"><label>City</label><input id="hCity" placeholder="Mumbai"></div>
+    <div class="fg"><label>Google Maps URL</label><input id="hMaps" placeholder="https://maps.google.com/..."></div>
+    <div class="fg"><label>Hotel Email</label><input id="hEmail" placeholder="info@hotel.com"></div>
+    <div class="fg"><label>Emergency Number</label><input id="hEM" placeholder="91XXXXXXXXXX"></div>
+    <div class="fg"><label>WiFi Name</label><input id="hWN" placeholder="HotelWifi_5G"></div>
+    <div class="fg"><label>WiFi Password</label><input id="hWP" placeholder="wifi@123"></div>
+    <div class="fg"><label>Check-in Time</label><input id="hCIT" value="2:00 PM"></div>
+    <div class="fg"><label>Checkout Time</label><input id="hCOT" value="11:00 AM"></div>
+    <div class="fg"><label>Welcome Message</label><input id="hWM" placeholder="Welcome! We are delighted to have you."></div>
+    <div class="fg"><label>⭐ Google Review URL</label><input id="hGRU" placeholder="https://g.page/r/YOUR_REVIEW_LINK"></div>
+  </div></div>
+
+  <div class="fsec"><div class="ft">Section 4 — Payment</div>
+    <div style="display:inline-flex;border:1px solid var(--bd);border-radius:var(--r);overflow:hidden;margin-bottom:14px">
+      <button type="button" id="tRZP" class="btn bg bsm" onclick="setPay('razorpay')">💳 Razorpay</button>
+      <button type="button" id="tUPI" class="btn bgh bsm" onclick="setPay('upi')">📱 UPI</button>
+    </div>
+    <input type="hidden" id="hPM" value="razorpay">
+    <div id="rzpFields" class="fgrid"><div class="fg"><label>Razorpay Key ID</label><input id="hRK" placeholder="rzp_live_..."></div><div class="fg"><label>Razorpay Secret</label><input id="hRS" type="password" placeholder="••••••••"></div></div>
+    <div id="upiFields" class="fgrid" style="display:none"><div class="fg"><label>UPI ID</label><input id="hUI" placeholder="hotel@okaxis"></div><div class="fg"><label>UPI Display Name</label><input id="hUD" placeholder="Grand Stay Hotel"></div></div>
+  </div>
+
+  <div class="fsec"><div class="ft">Section 5 — Charges & Schedule</div><div class="fgrid">
+    <div class="fg"><label>Checkout Hour (0-23)</label><input type="number" id="hCOH" value="11"></div>
+    <div class="fg"><label>Late Checkout Charge ₹</label><input type="number" id="hLC" value="500"></div>
+    <div class="fg"><label>Max Late Fee ₹</label><input type="number" id="hMLF" value="1500"></div>
+    <div class="fg"><label>Daily Report Hour</label><input type="number" id="hDRH" value="7"></div>
+    <div class="fg"><label>Monthly Report Hour</label><input type="number" id="hMRH" value="9"></div>
+    <div class="fg"><label>Reminder 1 Hour (night before)</label><input type="number" id="hR1H" value="21"></div>
+    <div class="fg"><label>Reminder 2 Hour (morning)</label><input type="number" id="hR2H" value="10"></div>
+    <div class="fg"><label>Reminder 2 Minute</label><input type="number" id="hR2M" value="30"></div>
+    <div class="fg"><label>Late Alert Hour</label><input type="number" id="hLAH" value="11"></div>
+    <div class="fg"><label>Late Alert Minute</label><input type="number" id="hLAM" value="30"></div>
+    <div class="fg"><label>Auto Charge Hour</label><input type="number" id="hACH" value="12"></div>
+    <div class="fg"><label>Auto Charge Minute</label><input type="number" id="hACM" value="0"></div>
+    <div class="fg"><label>Cloudinary Cloud Name</label><input id="hCCN" placeholder="dvka4sicp"></div>
+    <div class="fg"><label>Cloudinary Upload Preset</label><input id="hCUP" placeholder="hotel-id-proofs"></div>
+  </div></div>
+
+  <div class="fsec"><div class="ft">Section 6 — Rooms</div>
+    <div class="tw" style="margin-bottom:9px"><table>
+      <thead><tr><th>Room No.</th><th>Type</th><th>Floor</th><th>Rate ₹/night</th><th>QR Secret (auto)</th><th></th></tr></thead>
+      <tbody id="rBody"></tbody>
+    </table></div>
+    <button type="button" class="add-row" onclick="addRoom()">+ Add Room</button>
+  </div>
+
+  <div class="fsec"><div class="ft">Section 7 — Staff Departments</div>
+    <div class="tw" style="margin-bottom:9px"><table>
+      <thead><tr><th>Dept Key</th><th>Display Name</th><th>WhatsApp</th><th></th></tr></thead>
+      <tbody id="dBody"></tbody>
+    </table></div>
+    <button type="button" class="add-row" onclick="addDept()">+ Add Department</button>
+  </div>
+
+  <div class="fsec"><div class="ft">Section 8 — Owner Account (for hotel dashboard login)</div><div class="fgrid">
+    <div class="fg"><label>Owner Name</label><input id="hON" placeholder="Rajesh Sharma"></div>
+    <div class="fg"><label>Owner WhatsApp (for bot)</label><input id="hOWA" placeholder="91XXXXXXXXXX"></div>
+    <div class="fg"><label>Owner Username *</label><input id="hOU" placeholder="owner_grandstay"></div>
+    <div class="fg"><label>Owner Password *</label><input id="hOP" type="password" placeholder="Min 8 chars"></div>
+  </div></div>
+
+  <div style="display:flex;gap:10px;padding-bottom:36px;margin-top:6px">
+    <button type="submit" class="btn bg">➕ Create Hotel Client</button>
+    <button type="button" class="btn bgh" onclick="resetForm()">Reset</button>
+  </div>
+  </form>
+</div>
+
+<!-- CHANGE PASSWORD -->
+<div id="pg-pw" class="pg">
+  <h2 class="ptitle">🔑 Change Admin Password</h2>
+  <div class="fsec" style="max-width:400px">
+    <div class="fg"><label>New Password</label><input type="password" id="pwNew" placeholder="Min 8 characters"></div>
+    <div class="fg"><label>Confirm Password</label><input type="password" id="pwConf" placeholder="Repeat password"></div>
+    <button class="btn bg" onclick="changePw()">Update Password</button>
+    <div id="pwMsg" style="margin-top:10px;font-size:13px"></div>
+  </div>
+</div>
+
+</main>
+
+<!-- Modal -->
+<div class="ov" id="ov" onclick="cM()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="mt" id="mT">Details</div>
+    <div id="mC"></div>
+    <div style="margin-top:14px;display:flex;gap:8px">
+      <button class="btn bg" id="mSv" style="display:none" onclick="doSv()">Save</button>
+      <button class="btn bgh" onclick="cM()">Close</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let cp='dash',eid=null,svFn=null,allHotels=[];
+
+function nav(p){
+  document.querySelectorAll('.pg').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.ni').forEach(x=>x.classList.remove('on'));
+  const e=document.getElementById('pg-'+p);if(e)e.classList.add('on');
+  document.querySelectorAll('.ni').forEach(x=>{if((x.getAttribute('onclick')||'').includes("'"+p+"'"))x.classList.add('on');});
+  cp=p;lp(p);
+}
+async function lp(p){
+  if(p==='dash')lDash();else if(p==='hotels')lHotels();else if(p==='bk')lBk();
+}
+function toast(m,t='ok'){const e=document.getElementById('toast');e.textContent=m;e.className='toast show t'+t;setTimeout(()=>e.className='toast',3000);}
+async function api(path,method='GET',body=null){
+  const o={method,headers:{'Content-Type':'application/json'}};if(body)o.body=JSON.stringify(body);
+  try{const r=await fetch(path,o);if(r.status===401){window.location.href='/login?role=admin';return null;}return r.json();}catch{return null;}
+}
+const inr=v=>'₹'+(parseFloat(v)||0).toLocaleString('en-IN');
+const fd=d=>{if(!d)return'—';try{return new Date(d).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'});}catch{return String(d).split('T')[0];}};
+function oM(){document.getElementById('ov').classList.add('open');}
+function cM(){document.getElementById('ov').classList.remove('open');eid=null;svFn=null;document.getElementById('mSv').style.display='none';}
+function doSv(){if(svFn)svFn();}
+
+async function lDash(){
+  const d=await api('/api/admin/dashboard');if(!d)return;
+  document.getElementById('mdAH').textContent=d.active_hotels||0;
+  document.getElementById('mdTH').textContent='of '+(d.total_hotels||0)+' hotels';
+  document.getElementById('mdTG').textContent=d.total_guests_today||0;
+  document.getElementById('mdRev').textContent=inr(d.total_revenue_today);
+  // Hotel snapshots
+  const hs=await api('/api/admin/hotels');
+  allHotels=hs?.hotels||[];
+  const snap=document.getElementById('hotelSnap');
+  if(!allHotels.length){snap.innerHTML='<p style="color:var(--t2)">No hotels yet. <a href="#" onclick="nav(\'add\')" style="color:var(--gd)">Add one →</a></p>';return;}
+  let html='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">';
+  for(const h of allHotels){
+    const rv=await api('/api/admin/hotels/'+h.id);
+    const rev=await api('/api/admin/hotels/'+h.id+'/rooms');
+    const rooms=rev?.rooms||[];
+    const occ=rooms.filter(r=>r.live_status==='Occupied').length;
+    html+=`<div class="card" style="cursor:pointer" onclick="window.open('/hotel/${h.slug}','_blank')">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <div style="font-weight:600;font-size:14px">${h.hotel_name}</div>
+        <span class="bdg b${h.is_active?'a':'bo'}">${h.is_active?'Active':'Inactive'}</span>
+      </div>
+      <div style="font-size:12px;color:var(--t2);font-family:monospace;margin-bottom:8px">/hotel/${h.slug}</div>
+      <div style="display:flex;gap:12px;font-size:13px">
+        <span>🛏️ ${occ}/${rooms.length} occupied</span>
+        <span class="tag">${h.payment_mode||'razorpay'}</span>
+      </div>
+      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn bg bsm" onclick="event.stopPropagation();manageH(${h.id},'${h.slug}')">Manage</button>
+        <button class="btn bgh bsm" onclick="event.stopPropagation();window.open('/hotel/${h.slug}','_blank')">Open Dashboard →</button>
+        <button class="btn brd bsm" onclick="event.stopPropagation();togH(${h.id},${h.is_active})">${h.is_active?'Deactivate':'Activate'}</button>
+      </div>
+    </div>`;
+  }
+  html+='</div>';
+  snap.innerHTML=html;
+}
+
+async function lHotels(){
+  const d=await api('/api/admin/hotels');
+  allHotels=d?.hotels||[];
+  const list=document.getElementById('hotelList');
+  if(!allHotels.length){list.innerHTML='<p style="color:var(--t2)">No hotels. <a href="#" onclick="nav(\'add\')" style="color:var(--gd)">Add one →</a></p>';return;}
+  list.innerHTML=allHotels.map(h=>`
+    <div class="hotel-card">
+      <div>
+        <div style="font-weight:600;font-size:15px;margin-bottom:3px">${h.hotel_name}</div>
+        <div style="font-size:12px;color:var(--t2);font-family:monospace">/hotel/${h.slug} · ${h.instance_name}</div>
+        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+          <span class="bdg b${h.is_active?'a':'bo'}">${h.is_active?'Active':'Inactive'}</span>
+          <span class="tag">${h.payment_mode||'razorpay'}</span>
+        </div>
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn bg bsm" onclick="manageH(${h.id},'${h.slug}')">Manage</button>
+        <button class="btn bgh bsm" onclick="window.open('/hotel/${h.slug}','_blank')">Dashboard →</button>
+        <button class="btn brd bsm" onclick="togH(${h.id},${h.is_active})">${h.is_active?'Deactivate':'Activate'}</button>
+      </div>
+    </div>`).join('');
+  // Populate hotel filter in bookings
+  const sel=document.getElementById('bkHotel');
+  sel.innerHTML='<option value="">All Hotels</option>'+allHotels.map(h=>'<option value="'+h.id+'">'+h.hotel_name+'</option>').join('');
+}
+
+async function togH(id,cur){
+  await api('/api/admin/hotels/'+id,'PUT',{is_active:!cur});
+  toast(cur?'Hotel deactivated':'Hotel activated');lHotels();
+}
+
+async function manageH(id,slug){
+  const d=await api('/api/admin/hotels/'+id);
+  const h=d.hotel||{};const users=d.users||[];const rooms=d.rooms||[];const svcs=d.services||[];
+  document.getElementById('mT').textContent='Manage: '+h.hotel_name;
+  let usersHtml=users.map(u=>'<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--bd);font-size:13px">'+
+    '<div><b>'+u.name+'</b> <span class="tag">'+u.role+'</span></div>'+
+    '<div style="color:var(--t2);font-size:12px">'+( u.whatsapp_number||'no WA')+'</div>'+
+    '<button class="btn bgh bsm" onclick="eUser('+id+','+JSON.stringify(u).replace(/"/g,"'")+')" style="font-size:11px">Edit</button>'+
+    '</div>').join('');
+  document.getElementById('mC').innerHTML=`
+    <div style="font-size:12px;color:var(--t2);font-family:monospace;margin-bottom:12px">/hotel/${slug} · ${h.instance_name}</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;margin-bottom:14px">
+      <div>💳 ${h.payment_mode||'—'}</div>
+      <div>📅 Checkout: ${h.checkout_hour}:00 AM</div>
+      <div>💰 Late charge: ₹${h.late_charge_flat||0}</div>
+      <div>🛏️ ${rooms.length} rooms · 🛎️ ${svcs.length} services</div>
+    </div>
+    <div class="ft" style="font-size:12px;padding-bottom:6px;margin-bottom:8px">Users</div>
+    ${usersHtml||'<p style="color:var(--t2);font-size:12px">No users yet.</p>'}
+    <button class="btn bg bsm" onclick="addUserFor(${id})" style="margin-top:10px;width:100%">+ Add User</button>
+    <div class="dv"></div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="btn bgh bsm" onclick="window.open('/hotel/${slug}','_blank')">Open Hotel Dashboard →</button>
+      <button class="btn bgh bsm" onclick="window.open('/register/${slug}','_blank')">Preview Reg Page</button>
+      <button class="btn bgh bsm" onclick="window.open('/menu/${slug}','_blank')">Preview Menu Page</button>
+    </div>`;
+  oM();
+}
+
+async function eUser(hid,u){
+  document.getElementById('mT').textContent='Edit User: '+u.name;
+  document.getElementById('mC').innerHTML='<div style="display:grid;gap:10px">'+
+    '<div class="fg"><label>Name</label><input id="euN" class="ti" value="'+(u.name||'')+'"></div>'+
+    '<div class="fg"><label>WhatsApp (bot uses this — change = instant effect)</label><input id="euWA" class="ti" value="'+(u.whatsapp_number||'')+'"></div>'+
+    '<div class="fg"><label>Role</label><select id="euR" class="ti"><option value="staff"'+(u.role==="staff"?" selected":"")+'>Staff</option><option value="manager"'+(u.role==="manager"?" selected":"")+'>Manager</option><option value="owner"'+(u.role==="owner"?" selected":"")+'>Owner</option></select></div>'+
+    '<div class="fg"><label>Username</label><input id="euU" class="ti" value="'+(u.username||'')+'"></div>'+
+    '<div class="fg"><label>New Password (blank=no change)</label><input id="euP" class="ti" type="password" placeholder="Leave blank to keep"></div>'+
+    '<div class="fg"><label>Status</label><select id="euA" class="ti"><option value="true"'+(u.is_active?" selected":"")+'>Active</option><option value="false"'+(!u.is_active?" selected":"")+'>Inactive</option></select></div>'+
+    '</div>';
+  eid=u.id;svFn=async()=>{
+    const body={name:document.getElementById('euN').value,whatsapp_number:document.getElementById('euWA').value,role:document.getElementById('euR').value,username:document.getElementById('euU').value,is_active:document.getElementById('euA').value==='true'};
+    const pw=document.getElementById('euP').value;if(pw)body.password=pw;
+    const r=await api('/api/admin/hotels/'+hid+'/users/'+eid,'PUT',body);
+    if(r&&r.success){toast('User updated!');cM();manageH(hid,allHotels.find(h=>h.id===hid)?.slug||'');}else toast('Error','er');
+  };
+  document.getElementById('mSv').style.display='inline-flex';oM();
+}
+
+async function addUserFor(hid){
+  document.getElementById('mT').textContent='Add User';
+  document.getElementById('mC').innerHTML='<div style="display:grid;gap:10px">'+
+    '<div class="fg"><label>Name *</label><input id="nuN" class="ti" placeholder="John Staff"></div>'+
+    '<div class="fg"><label>WhatsApp</label><input id="nuWA" class="ti" placeholder="91XXXXXXXXXX"><small style="color:var(--t2);font-size:11px">Bot recognizes this number. Change anytime = instant.</small></div>'+
+    '<div class="fg"><label>Role</label><select id="nuR" class="ti"><option value="staff">Staff</option><option value="manager">Manager</option><option value="owner">Owner</option></select></div>'+
+    '<div class="fg"><label>Username *</label><input id="nuU" class="ti" placeholder="john_staff"></div>'+
+    '<div class="fg"><label>Password *</label><input id="nuP" class="ti" type="password" placeholder="Min 6 chars"></div>'+
+    '</div>';
+  eid=null;svFn=async()=>{
+    const r=await api('/api/admin/hotels/'+hid+'/users','POST',{name:document.getElementById('nuN').value,whatsapp_number:document.getElementById('nuWA').value,role:document.getElementById('nuR').value,username:document.getElementById('nuU').value,password:document.getElementById('nuP').value});
+    if(r&&r.success){toast('User added!');cM();manageH(hid,allHotels.find(h=>h.id===hid)?.slug||'');}else toast('Error: '+(r?.detail||'Failed'),'er');
+  };
+  document.getElementById('mSv').style.display='inline-flex';oM();
+}
+
+async function lBk(){
+  const hid=document.getElementById('bkHotel').value;const st=document.getElementById('bkSt').value;
+  const url='/api/admin/bookings?'+(hid?'hotel_id='+hid:'')+(st?'&status='+st:'');
+  const d=await api(url);const tb=document.getElementById('bkTb');
+  const bks=d?.bookings||[];
+  if(!bks.length){tb.innerHTML='<tr><td colspan="9" style="text-align:center;color:var(--t2);padding:28px">No bookings found.</td></tr>';return;}
+  tb.innerHTML=bks.map(b=>`<tr>
+    <td style="font-family:monospace;font-size:11px">${b.booking_id}</td>
+    <td>${b.guest_name}</td><td>${b.guest_phone}</td>
+    <td><b>${b.room_number}</b></td>
+    <td>${allHotels.find(h=>h.id===b.hotel_id)?.hotel_name||b.hotel_id}</td>
+    <td>${fd(b.checkin_date)}</td><td>${fd(b.checkout_date)}</td>
+    <td><span class="bdg b${(b.status||'').toLowerCase()==='active'?'a':'bc'}">${b.status}</span></td>
+    <td style="color:${parseFloat(b.balance_due)>0?'#f85149':'#3fb950'}">₹${parseFloat(b.balance_due||0).toFixed(0)}</td>
+  </tr>`).join('');
+}
+
+// Add Hotel Form helpers
+function setPay(m){
+  document.getElementById('hPM').value=m;
+  document.getElementById('tRZP').className='btn '+(m==='razorpay'?'bg':'bgh')+' bsm';
+  document.getElementById('tUPI').className='btn '+(m==='upi'?'bg':'bgh')+' bsm';
+  document.getElementById('rzpFields').style.display=m==='razorpay'?'grid':'none';
+  document.getElementById('upiFields').style.display=m==='upi'?'grid':'none';
+}
+function gSec(){const c='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';return Array.from({length:16},()=>c[Math.floor(Math.random()*36)]).join('');}
+function addRoom(){
+  const s=gSec();const tr=document.createElement('tr');
+  tr.innerHTML='<td><input class="rni ti" placeholder="101" style="width:70px"></td>'+
+    '<td><select class="rti ti" style="width:105px"><option>Standard</option><option>Deluxe</option><option>Suite</option><option>Super Deluxe</option></select></td>'+
+    '<td><input class="rfi ti" type="number" value="1" style="width:50px"></td>'+
+    '<td><input class="rri ti" type="number" placeholder="1500" style="width:80px"></td>'+
+    '<td><input class="rsi ti" value="'+s+'" readonly style="width:150px;font-family:monospace;font-size:11px"></td>'+
+    '<td><button type="button" class="btn bgh bsm" onclick="this.closest(\'tr\').querySelector(\'.rsi\').value=gSec()">🔄</button> '+
+    '<button type="button" class="btn brd bsm" onclick="this.closest(\'tr\').remove()">✕</button></td>';
+  document.getElementById('rBody').appendChild(tr);
+}
+function addDept(k='',n='',p=''){
+  const tr=document.createElement('tr');
+  tr.innerHTML='<td><input class="dki ti" value="'+k+'" placeholder="Kitchen" style="width:110px"></td>'+
+    '<td><input class="dni ti" value="'+n+'" placeholder="Kitchen Team"></td>'+
+    '<td><input class="dpi ti" value="'+p+'" placeholder="91XXXXXXXXXX" style="width:150px"></td>'+
+    '<td><button type="button" class="btn brd bsm" onclick="this.closest(\'tr\').remove()">✕</button></td>';
+  document.getElementById('dBody').appendChild(tr);
+}
+function initDefaultRows(){
+  document.getElementById('rBody').innerHTML='';
+  document.getElementById('dBody').innerHTML='';
+  ['101','102','201','202','301'].forEach(r=>{addRoom();document.querySelector('#rBody tr:last-child .rni').value=r;});
+  [['Kitchen','Kitchen Team'],['Laundry','Laundry Department'],['Housekeeping','Housekeeping Team'],['Reception','Front Desk'],['Management','Hotel Management']].forEach(([k,n])=>addDept(k,n));
+}
+function resetForm(){document.getElementById('hForm').reset();initDefaultRows();}
+
+async function submitH(e){
+  e.preventDefault();
+  const rooms=[];
+  document.querySelectorAll('#rBody tr').forEach(tr=>{
+    const n=tr.querySelector('.rni')?.value.trim();
+    if(n)rooms.push({room_number:n,room_type:tr.querySelector('.rti')?.value||'Standard',floor:parseInt(tr.querySelector('.rfi')?.value)||1,room_rate:parseFloat(tr.querySelector('.rri')?.value)||0,qr_secret:tr.querySelector('.rsi')?.value||gSec()});
+  });
+  const depts=[];
+  document.querySelectorAll('#dBody tr').forEach(tr=>{
+    const k=tr.querySelector('.dki')?.value.trim();
+    if(k)depts.push({department:k,display_name:tr.querySelector('.dni')?.value||k,whatsapp_number:tr.querySelector('.dpi')?.value||''});
+  });
+  const body={hotel_name:document.getElementById('hName').value,slug:document.getElementById('hSlug').value,instance_name:document.getElementById('hInst').value,gotenberg_url:document.getElementById('hGot').value,tagline:document.getElementById('hTag').value,logo_url:document.getElementById('hLogo').value,primary_color:document.getElementById('hPC').value,secondary_color:document.getElementById('hSC').value,background_color:document.getElementById('hBC').value,button_color:document.getElementById('hBTC').value,font_choice:document.getElementById('hFont').value,address:document.getElementById('hAddr').value,city:document.getElementById('hCity').value,google_maps_url:document.getElementById('hMaps').value,hotel_email:document.getElementById('hEmail').value,emergency_number:document.getElementById('hEM').value,wifi_name:document.getElementById('hWN').value,wifi_password:document.getElementById('hWP').value,check_in_time:document.getElementById('hCIT').value,checkout_time_display:document.getElementById('hCOT').value,welcome_message:document.getElementById('hWM').value,google_review_url:document.getElementById('hGRU').value,payment_mode:document.getElementById('hPM').value,razorpay_key_id:document.getElementById('hRK').value,razorpay_secret:document.getElementById('hRS').value,upi_id:document.getElementById('hUI').value,upi_display_name:document.getElementById('hUD').value,cloudinary_cloud_name:document.getElementById('hCCN').value,cloudinary_upload_preset:document.getElementById('hCUP').value,checkout_hour:parseInt(document.getElementById('hCOH').value)||11,late_charge_flat:parseFloat(document.getElementById('hLC').value)||500,max_late_fee:parseFloat(document.getElementById('hMLF').value)||1500,sched_daily_report_hour:parseInt(document.getElementById('hDRH').value)||7,sched_monthly_report_hour:parseInt(document.getElementById('hMRH').value)||9,sched_reminder1_hour:parseInt(document.getElementById('hR1H').value)||21,sched_reminder2_hour:parseInt(document.getElementById('hR2H').value)||10,sched_reminder2_min:parseInt(document.getElementById('hR2M').value)||30,sched_late_alert_hour:parseInt(document.getElementById('hLAH').value)||11,sched_late_alert_min:parseInt(document.getElementById('hLAM').value)||30,sched_auto_charge_hour:parseInt(document.getElementById('hACH').value)||12,sched_auto_charge_min:parseInt(document.getElementById('hACM').value)||0,rooms,departments:depts,owner_name:document.getElementById('hON').value,owner_whatsapp:document.getElementById('hOWA').value,owner_username:document.getElementById('hOU').value,owner_password:document.getElementById('hOP').value};
+  const r=await api('/api/admin/hotels','POST',body);
+  if(r&&r.success){toast('✅ Hotel created!');resetForm();nav('hotels');}
+  else toast('Error: '+(r?.detail||r?.error||'Failed'),'er');
+}
+
+async function changePw(){
+  const n=document.getElementById('pwNew').value,c=document.getElementById('pwConf').value;
+  const msg=document.getElementById('pwMsg');
+  if(!n||n.length<8){msg.style.color='#f85149';msg.textContent='Password must be at least 8 characters';return;}
+  if(n!==c){msg.style.color='#f85149';msg.textContent='Passwords do not match';return;}
+  const r=await api('/api/admin/password','PUT',{new_password:n});
+  if(r&&r.success){msg.style.color='#3fb950';msg.textContent='✅ Password updated!';}
+  else{msg.style.color='#f85149';msg.textContent='Error updating password';}
+}
+
+async function logout(){await fetch('/auth/logout',{method:'POST'});window.location.href='/login?role=admin';}
+
+// Init
+(async()=>{
+  const d=await api('/auth/me');
+  if(!d||!d.authenticated||d.role!=='superadmin'){window.location.href='/login?role=admin';return;}
+  initDefaultRows();lDash();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,492 @@
+from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
+from services import database as db
+from services.cache import get_session, set_session, set_room, calc_ttl, get_room as cache_get_room
+from services.whatsapp import send_text, send_to_phones
+from services.helpers import booking_id as gen_bk, calc_nights, fmt_date, ist_now, categorize_service, request_id as gen_sr
+from datetime import date
+import logging
+
+router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def themed(hotel: dict, title: str, body: str) -> str:
+    pri = hotel.get("primary_color","#c8a84b")
+    sec = hotel.get("secondary_color","#1a2942")
+    bg  = hotel.get("background_color","#0d1117")
+    btn = hotel.get("button_color","#c8a84b")
+    txt = hotel.get("text_color","#ffffff")
+    fnt = hotel.get("font_choice","Outfit")
+    logo= hotel.get("logo_url","")
+    hn  = hotel.get("hotel_name","Hotel")
+    tag = hotel.get("tagline","")
+    addr= hotel.get("address","")
+    city= hotel.get("city","")
+    em  = hotel.get("emergency_number","")
+    maps= hotel.get("google_maps_url","")
+    email=hotel.get("hotel_email","")
+    ci_t= hotel.get("check_in_time","2:00 PM")
+    co_t= hotel.get("checkout_time_display","11:00 AM")
+    logo_h = f'<img src="{logo}" alt="{hn}" style="height:60px;object-fit:contain;display:block;margin:0 auto 10px">' if logo else ""
+    maps_h = f'<a href="{maps}" target="_blank" style="color:{pri};font-size:12px">📍 Get Directions</a>' if maps else ""
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
+<title>{title} — {hn}</title>
+<link href="https://fonts.googleapis.com/css2?family={fnt.replace(' ','+')}:wght@300;400;500;600&family=Playfair+Display:wght@600&display=swap" rel="stylesheet">
+<style>
+:root{{--p:{pri};--s:{sec};--bg:{bg};--btn:{btn};--t:{txt};}}
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{font-family:'{fnt}',sans-serif;background:var(--bg);color:var(--t);min-height:100vh;}}
+.hdr{{background:var(--s);padding:18px 16px 14px;text-align:center;border-bottom:3px solid var(--p);}}
+.hdr h1{{font-family:'Playfair Display',serif;font-size:21px;color:var(--p);}}
+.hdr .sub{{font-size:12px;opacity:.7;margin-top:3px;}}
+.wrap{{max-width:480px;margin:0 auto;padding:18px 14px;}}
+.card{{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:18px;margin-bottom:14px;}}
+.ct{{font-size:13px;color:var(--p);font-weight:600;margin-bottom:12px;}}
+label{{font-size:12px;color:rgba(255,255,255,.55);display:block;margin:10px 0 3px;}}
+input,select,textarea{{width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:var(--t);padding:10px 12px;border-radius:8px;font-size:14px;font-family:'{fnt}',sans-serif;transition:border .15s;}}
+input:focus,select:focus{{outline:none;border-color:var(--p);}}
+select option{{background:#1a1a2e;}}
+.btn{{width:100%;padding:13px;background:var(--btn);color:#000;font-size:15px;font-weight:700;border:none;border-radius:9px;cursor:pointer;font-family:'{fnt}',sans-serif;margin-top:14px;transition:opacity .15s;}}
+.btn:hover{{opacity:.9;}} .btn:disabled{{opacity:.5;cursor:not-allowed;}}
+.finfo{{background:rgba(255,255,255,.04);border-radius:9px;padding:12px;margin-top:14px;font-size:12px;}}
+.frow{{display:flex;align-items:center;gap:7px;padding:4px 0;color:rgba(255,255,255,.65);}}
+.toast{{position:fixed;bottom:18px;left:50%;transform:translateX(-50%) translateY(80px);background:rgba(0,0,0,.92);border:1px solid var(--p);color:var(--t);padding:11px 20px;border-radius:8px;font-size:13px;z-index:9999;transition:transform .3s;text-align:center;max-width:88%;}}
+.toast.show{{transform:translateX(-50%) translateY(0);}}
+.scard{{background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:8px;padding:11px;margin-bottom:7px;cursor:pointer;transition:border .15s;}}
+.scard:hover{{border-color:var(--p);}}
+.ctitle{{font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--p);margin:12px 0 5px;font-weight:600;}}
+</style></head><body>
+<div class="hdr">{logo_h}<h1>{hn}</h1><div class="sub">{tag}</div></div>
+<div class="wrap">
+{body}
+<div class="finfo">
+  {f'<div class="frow">📍 {addr}{", "+city if city else ""} {maps_h}</div>' if addr else ""}
+  {f'<div class="frow">📞 Emergency: {em}</div>' if em else ""}
+  {f'<div class="frow">✉️ {email}</div>' if email else ""}
+  <div class="frow">⏰ Check-in: {ci_t} &nbsp;|&nbsp; Checkout: {co_t}</div>
+</div></div>
+<div class="toast" id="toast"></div>
+<script>
+function showToast(m,ok=true){{const t=document.getElementById('toast');t.textContent=m;t.style.borderColor=ok?'var(--p)':'#e74c3c';t.classList.add('show');setTimeout(()=>t.classList.remove('show'),4000);}}
+</script></body></html>"""
+
+
+# ── REGISTRATION PAGE ─────────────────────────────────────────────
+@router.get("/register/{slug}", response_class=HTMLResponse)
+async def reg_page(slug: str, request: Request):
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404,"Hotel not found")
+    hid = hotel["id"]
+    rooms = await db.get_all_rooms(hid)
+    room_opts = ""
+    for r in rooms:
+        occ = await cache_get_room(r["room_number"])
+        if not occ:
+            room_opts += f'<option value="{r["room_number"]}" data-secret="{r["qr_secret"]}" data-rate="{r["room_rate"] or 0}">{r["room_number"]} — {r["room_type"]} (₹{r["room_rate"] or 0}/night)</option>'
+
+    body = f"""
+<div class="card"><div class="ct">🏨 Guest Registration</div>
+  <p style="font-size:13px;opacity:.65">{hotel.get("welcome_message","Welcome! Please fill your details.")}</p>
+</div>
+<div class="card"><div class="ct">🛏️ Room & Dates</div>
+  <label>Select Room *</label>
+  <select id="roomSel" onchange="onRoom()"><option value="">-- Select Room --</option>{room_opts}</select>
+  <div id="rateInfo" style="display:none;margin-top:8px;font-size:12px;opacity:.6"></div>
+  <label>Check-in Date *</label>
+  <input type="date" id="ciDate" min="{ist_now().strftime('%Y-%m-%d')}" value="{ist_now().strftime('%Y-%m-%d')}">
+  <label>Check-out Date *</label>
+  <input type="date" id="coDate" min="{ist_now().strftime('%Y-%m-%d')}">
+</div>
+<div class="card"><div class="ct">👤 Primary Guest</div>
+  <label>Full Name *</label><input type="text" id="gName" placeholder="As per ID proof">
+  <label>WhatsApp Number *</label><input type="tel" id="gPhone" placeholder="91XXXXXXXXXX">
+  <label>Alternate Phone</label><input type="tel" id="gAlt" placeholder="Optional">
+  <label>Total Number of Guests *</label><input type="number" id="gCount" value="1" min="1" max="10" onchange="updateExtra()">
+</div>
+<div class="card"><div class="ct">🪪 ID Proof</div>
+  <label>ID Type *</label>
+  <select id="idType"><option value="">-- Select --</option>
+    <option>Aadhaar Card</option><option>PAN Card</option>
+    <option>Passport</option><option>Driving License</option><option>Voter ID</option>
+  </select>
+  <label>ID Number *</label><input type="text" id="idNum" placeholder="Enter number">
+  <label>ID Photo — Front *</label>
+  <input type="file" id="idF" accept="image/*" capture="environment" onchange="upload(this,'idFUrl','idFPrev')">
+  <div id="idFPrev"></div><input type="hidden" id="idFUrl">
+  <label>ID Photo — Back</label>
+  <input type="file" id="idB" accept="image/*" capture="environment" onchange="upload(this,'idBUrl','idBPrev')">
+  <div id="idBPrev"></div><input type="hidden" id="idBUrl">
+</div>
+<div id="extraGuests"></div>
+<button class="btn" id="subBtn" onclick="submit()">✅ Complete Registration</button>
+<script>
+const CLOUD="{hotel.get('cloudinary_cloud_name','')}",PRESET="{hotel.get('cloudinary_upload_preset','')}",SLUG="{slug}";
+
+function onRoom(){{
+  const o=document.getElementById('roomSel').selectedOptions[0];
+  const ri=document.getElementById('rateInfo');
+  if(o&&o.value){{ri.style.display='block';ri.textContent='₹'+o.dataset.rate+'/night';}}
+  else ri.style.display='none';
+}}
+
+function updateExtra(){{
+  const n=parseInt(document.getElementById('gCount').value)||1;
+  let h='';
+  for(let i=2;i<=n;i++)h+=`<div class="card"><div class="ct">👤 Guest ${{i}}</div>
+    <label>Full Name</label><input id="ag_n_${{i}}" placeholder="Name">
+    <label>ID Type</label><select id="ag_t_${{i}}"><option value="">--Select--</option>
+    <option>Aadhaar Card</option><option>PAN Card</option><option>Passport</option><option>Driving License</option></select>
+    <label>ID Number</label><input id="ag_id_${{i}}" placeholder="ID number">
+    <label>ID Photo Front</label>
+    <input type="file" id="ag_f_${{i}}" accept="image/*" capture="environment" onchange="upload(this,'ag_fu_${{i}}','ag_fp_${{i}}')">
+    <div id="ag_fp_${{i}}"></div><input type="hidden" id="ag_fu_${{i}}">
+  </div>`;
+  document.getElementById('extraGuests').innerHTML=h;
+}}
+
+async function upload(inp,urlId,prevId){{
+  if(!CLOUD||!PRESET){{showToast('Cloudinary not configured',false);return;}}
+  if(!inp.files||!inp.files[0])return;
+  showToast('Uploading...');
+  const fd=new FormData();fd.append('file',inp.files[0]);fd.append('upload_preset',PRESET);fd.append('folder','hotel-id-proofs');
+  try{{
+    const r=await fetch(`https://api.cloudinary.com/v1_1/${{CLOUD}}/image/upload`,{{method:'POST',body:fd}});
+    const d=await r.json();
+    if(d.secure_url){{
+      document.getElementById(urlId).value=d.secure_url;
+      const p=document.getElementById(prevId);
+      if(p)p.innerHTML=`<img src="${{d.secure_url}}" style="width:100%;max-height:110px;object-fit:cover;border-radius:6px;margin-top:5px">`;
+      showToast('Photo uploaded ✓');
+    }}else showToast('Upload failed',false);
+  }}catch(e){{showToast('Upload error',false);}}
+}}
+
+async function submit(){{
+  const room=document.getElementById('roomSel').value;
+  const ci=document.getElementById('ciDate').value;
+  const co=document.getElementById('coDate').value;
+  const name=document.getElementById('gName').value.trim();
+  const phone=document.getElementById('gPhone').value.trim();
+  const idType=document.getElementById('idType').value;
+  const idNum=document.getElementById('idNum').value.trim();
+  const idPhoto=document.getElementById('idFUrl').value;
+  const count=parseInt(document.getElementById('gCount').value)||1;
+  if(!room){{showToast('Select a room',false);return;}}
+  if(!ci||!co||co<=ci){{showToast('Select valid check-in & checkout dates',false);return;}}
+  if(!name){{showToast('Enter guest name',false);return;}}
+  if(!phone||phone.length<10){{showToast('Enter valid WhatsApp number',false);return;}}
+  if(!idType){{showToast('Select ID type',false);return;}}
+  if(!idNum){{showToast('Enter ID number',false);return;}}
+  if(!idPhoto){{showToast('Upload ID proof photo (front)',false);return;}}
+  const btn=document.getElementById('subBtn');
+  btn.disabled=true;btn.textContent='Processing...';
+  const opt=document.getElementById('roomSel').selectedOptions[0];
+  const secret=opt?.dataset?.secret||'';
+  const ag=[];
+  for(let i=2;i<=count;i++){{
+    const n=document.getElementById('ag_n_'+i)?.value.trim();
+    if(n)ag.push({{name:n,id_proof_type:document.getElementById('ag_t_'+i)?.value||'',
+      id_proof_number:document.getElementById('ag_id_'+i)?.value.trim()||'',
+      id_proof_photo:document.getElementById('ag_fu_'+i)?.value||''}});
+  }}
+  try{{
+    const r=await fetch('/api/guest/register',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{slug:SLUG,room,secret,checkin_date:ci,checkout_date:co,
+        name,phone,alternate_phone:document.getElementById('gAlt').value.trim(),
+        guest_count:count,id_proof_type:idType,id_proof_number:idNum,
+        id_proof_photo:idPhoto,id_proof_photo_back:document.getElementById('idBUrl').value,
+        additional_guests:ag}})}});
+    const d=await r.json();
+    if(d.success){{
+      document.querySelector('.wrap').innerHTML=`<div class="card" style="text-align:center;padding:28px">
+        <div style="font-size:48px;margin-bottom:12px">✅</div>
+        <h2 style="color:var(--p);font-family:'Playfair Display',serif;margin-bottom:10px">Registration Complete!</h2>
+        <p style="opacity:.75;margin-bottom:16px">Your check-in request has been submitted.</p>
+        <div style="background:rgba(255,255,255,.06);border-radius:8px;padding:13px;text-align:left;font-size:13px;line-height:1.8">
+          <div>🏨 Room: <b>${{room}}</b></div>
+          <div>📅 Check-in: <b>${{ci}}</b></div>
+          <div>📅 Checkout: <b>${{co}}</b></div>
+          <div>🔖 Booking: <b style="font-family:monospace">${{d.booking_id}}</b></div>
+        </div>
+        <p style="margin-top:14px;opacity:.6;font-size:12px">Reception will approve your check-in on WhatsApp shortly. Keep your phone nearby. 🙏</p>
+      </div>`;
+    }}else{{showToast(d.error||'Registration failed',false);btn.disabled=false;btn.textContent='✅ Complete Registration';}}
+  }}catch(e){{showToast('Network error',false);btn.disabled=false;btn.textContent='✅ Complete Registration';}}
+}}
+const urlP=new URLSearchParams(window.location.search);
+const urlRoom=urlP.get('room');
+if(urlRoom){{const opts=[...document.getElementById('roomSel').options];const m=opts.find(o=>o.value===urlRoom);if(m){{document.getElementById('roomSel').value=urlRoom;onRoom();}}}}
+</script>"""
+    return HTMLResponse(themed(hotel,"Guest Registration",body))
+
+
+# ── MENU / SERVICE PAGE ───────────────────────────────────────────
+@router.get("/menu/{slug}", response_class=HTMLResponse)
+async def menu_page(slug: str, request: Request):
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    hid = hotel["id"]
+    services = await db.get_services(hid)
+    pri = hotel.get("primary_color","#c8a84b")
+
+    cats: dict = {}
+    for s in services:
+        cats.setdefault(s.get("category","Other"),[]).append(s)
+
+    svc_html = ""
+    for cat, items in cats.items():
+        svc_html += f'<div class="ctitle">🔹 {cat}</div>'
+        for s in items:
+            p = float(s.get("price",0))
+            ps = f"₹{p:.0f}" if p>0 else "Free"
+            desc = s.get("description","") or ""
+            svc_html += f"""<div class="scard" onclick="reqSvc('{s['service_name'].replace("'","\\'")}',{p})">
+              <div style="display:flex;justify-content:space-between;align-items:center">
+                <div><b style="font-size:14px">{s['service_name']}</b>{f'<div style="font-size:11px;opacity:.55;margin-top:2px">{desc}</div>' if desc else ''}</div>
+                <span style="font-weight:600;color:{pri};white-space:nowrap;margin-left:10px">{ps}</span>
+              </div></div>"""
+
+    body = f"""
+<div class="card" style="text-align:center;padding:14px">
+  <div id="gInfo" style="font-size:13px;opacity:.65">Enter your room to get started</div>
+</div>
+<div class="card" id="initCard">
+  <div class="ct">🏨 Confirm Your Room</div>
+  <label>Room Number</label><input type="text" id="roomInp" placeholder="e.g. 101" style="text-transform:uppercase">
+  <label>Your WhatsApp Number</label><input type="tel" id="phoneInp" placeholder="91XXXXXXXXXX">
+  <button class="btn" onclick="initGuest()" style="margin-top:11px">Continue →</button>
+</div>
+<div id="svcDiv" style="display:none">
+  <div class="card">
+    <div class="ct">🛎️ Available Services</div>
+    <div style="font-size:12px;opacity:.55;margin-bottom:12px">⏰ Hours: {hotel.get('svc_open_hour',7)}AM – {hotel.get('svc_close_hour',23)}PM · Checkout: {hotel.get('checkout_time_display','11:00 AM')}</div>
+    {svc_html or '<p style="opacity:.5;text-align:center;padding:16px">No services available.</p>'}
+  </div>
+</div>
+<div id="billDiv" style="display:none" class="card">
+  <div class="ct">💰 My Bill Summary</div>
+  <div id="billList"></div>
+  <div id="billTotal" style="font-weight:700;margin-top:8px;color:{pri}"></div>
+</div>
+<script>
+let gRoom='',gPhone='',gBid='';
+async function initGuest(){{
+  gRoom=document.getElementById('roomInp').value.trim().toUpperCase();
+  gPhone=document.getElementById('phoneInp').value.trim();
+  if(!gRoom||!gPhone){{showToast('Enter room and phone',false);return;}}
+  const r=await fetch('/api/guest/session?phone='+gPhone);
+  const d=await r.json();
+  if(d.found){{
+    gBid=d.booking_id;
+    document.getElementById('gInfo').textContent='Room '+gRoom+' · '+d.name;
+    document.getElementById('initCard').style.display='none';
+    document.getElementById('svcDiv').style.display='block';
+    document.getElementById('billDiv').style.display='block';
+    loadBill();
+  }}else showToast('No active booking for this number',false);
+}}
+async function loadBill(){{
+  if(!gBid)return;
+  const r=await fetch('/api/guest/charges?booking_id='+gBid);
+  const d=await r.json();
+  if(d.charges&&d.charges.length){{
+    let h='',tot=0;
+    d.charges.forEach(c=>{{
+      h+=`<div style="display:flex;justify-content:space-between;font-size:12px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.07)">
+        <span>${{c.description}}</span><span>₹${{parseFloat(c.total).toFixed(0)}}</span></div>`;
+      tot+=parseFloat(c.total);
+    }});
+    document.getElementById('billList').innerHTML=h;
+    document.getElementById('billTotal').textContent='Total: ₹'+tot.toFixed(0);
+  }}
+}}
+async function reqSvc(svc,price){{
+  if(!gRoom||!gPhone){{showToast('Confirm your room first',false);return;}}
+  if(price>0&&!confirm(svc+'\\n₹'+price+' will be added to your bill. Confirm?'))return;
+  const r=await fetch('/api/guest/service',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{slug:'{slug}',room:gRoom,phone:gPhone,booking_id:gBid,service:svc}})}});
+  const d=await r.json();
+  if(d.success){{showToast('✅ Request sent! Our team will attend shortly.');loadBill();}}
+  else showToast('Error: '+(d.error||'Try again'),false);
+}}
+const p=new URLSearchParams(window.location.search);
+if(p.get('r'))document.getElementById('roomInp').value=p.get('r');
+if(p.get('p')){{document.getElementById('phoneInp').value=p.get('p');if(p.get('r'))setTimeout(initGuest,300);}}
+</script>"""
+    return HTMLResponse(themed(hotel,"Services & Menu",body))
+
+
+# ── BILL PAGE ─────────────────────────────────────────────────────
+@router.get("/bill/{slug}", response_class=HTMLResponse)
+async def bill_page(slug: str, request: Request):
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    pri = hotel.get("primary_color","#c8a84b")
+    body = f"""
+<div class="card"><div class="ct">💰 View Your Bill</div>
+  <label>Your WhatsApp Number</label>
+  <input type="tel" id="bPhone" placeholder="91XXXXXXXXXX">
+  <button class="btn" onclick="loadBill()">View My Bill →</button>
+</div>
+<div id="bDiv" style="display:none"></div>
+<script>
+async function loadBill(){{
+  const phone=document.getElementById('bPhone').value.trim();
+  if(!phone){{showToast('Enter your phone number',false);return;}}
+  const r=await fetch('/api/guest/bill?phone='+phone+'&slug={slug}');
+  const d=await r.json();
+  if(!d.found){{showToast('No active booking found',false);return;}}
+  let h=`<div class="card"><div class="ct">🔖 Booking Details</div>
+    <div style="font-size:13px;line-height:1.8">
+      <div>👤 <b>${{d.guest_name}}</b></div>
+      <div>🏨 Room: <b>${{d.room_number}}</b></div>
+      <div>📅 ${{d.checkin_date}} → ${{d.checkout_date}}</div>
+      <div style="font-family:monospace;font-size:11px">🔖 ${{d.booking_id}}</div>
+    </div></div>
+    <div class="card"><div class="ct">📋 Charges</div>`;
+  let tot=0,paid=0;
+  (d.charges||[]).forEach(c=>{{
+    const t=parseFloat(c.total);tot+=t;
+    if(c.payment_status==='Paid')paid+=t;
+    const clr=c.payment_status==='Paid'?'#3fb950':'#f85149';
+    h+=`<div style="display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.07);font-size:13px">
+      <div><div>${{c.description}}</div><div style="font-size:11px;opacity:.5">${{c.service_type}}</div></div>
+      <div style="text-align:right"><div>₹${{t.toFixed(0)}}</div><div style="font-size:11px;color:${{clr}}">${{c.payment_status}}</div></div>
+    </div>`;
+  }});
+  const bal=tot-paid;
+  h+=`<div style="margin-top:12px;padding-top:10px;border-top:2px solid rgba(255,255,255,.12)">
+    <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px"><span>Total Billed</span><span>₹${{tot.toFixed(0)}}</span></div>
+    <div style="display:flex;justify-content:space-between;font-size:13px;color:#3fb950;margin-bottom:4px"><span>Paid</span><span>₹${{paid.toFixed(0)}}</span></div>
+    <div style="display:flex;justify-content:space-between;font-size:15px;font-weight:700;color:${{bal>0?'#f85149':'#3fb950'}}">
+      <span>Balance Due</span><span>${{bal>0?'₹'+bal.toFixed(0):'✓ PAID'}}</span></div>
+  </div></div>`;
+  document.getElementById('bDiv').innerHTML=h;
+  document.getElementById('bDiv').style.display='block';
+}}
+const p=new URLSearchParams(window.location.search);
+if(p.get('phone')){{document.getElementById('bPhone').value=p.get('phone');loadBill();}}
+</script>"""
+    return HTMLResponse(themed(hotel,"My Bill",body))
+
+
+# ── GUEST API ENDPOINTS ───────────────────────────────────────────
+@router.post("/api/guest/register")
+async def api_register(request: Request):
+    try: body = await request.json()
+    except: return JSONResponse({"success":False,"error":"Invalid JSON"},400)
+    slug = body.get("slug","")
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: return JSONResponse({"success":False,"error":"Hotel not found"},404)
+    hid = hotel["id"]
+    room  = str(body.get("room","")).strip().upper()
+    secret= str(body.get("secret","")).strip()
+    phone = str(body.get("phone","")).strip()
+    name  = str(body.get("name","")).strip()
+    ci    = str(body.get("checkin_date","")).strip()
+    co    = str(body.get("checkout_date","")).strip()
+    count = int(body.get("guest_count",1))
+    alt   = str(body.get("alternate_phone","")).strip()
+    extra = body.get("additional_guests",[])
+    idt   = str(body.get("id_proof_type","")).strip()
+    idn   = str(body.get("id_proof_number","")).strip().upper()
+    idp   = str(body.get("id_proof_photo","")).strip()
+    idb   = str(body.get("id_proof_photo_back","")).strip()
+    if not all([room,phone,name,ci,co]):
+        return JSONResponse({"success":False,"error":"Missing required fields"},400)
+    room_row = await db.get_room(room, hid)
+    if not room_row: return JSONResponse({"success":False,"error":f"Room {room} not found"},400)
+    if room_row.get("qr_secret") and room_row["qr_secret"] != secret:
+        return JSONResponse({"success":False,"error":"Invalid QR code. Scan the QR inside your room."},400)
+    occ = await cache_get_room(room)
+    if occ and occ.replace("PENDING:","") != phone:
+        return JSONResponse({"success":False,"error":f"Room {room} is currently occupied."},400)
+    bk_id = gen_bk()
+    ttl = calc_ttl(co)
+    nights = calc_nights(ci, co)
+    rate = float(room_row.get("room_rate",0) or 0)
+    instance = hotel["instance_name"]
+    staff_phones = await db.get_staff_phones(hid)
+    sess = {"phone":phone,"name":name,"room":room,"bookingId":bk_id,
+            "checkinDate":ci,"checkoutDate":co,"status":"AWAITING_APPROVAL",
+            "orders":[],"sessionType":"HOTEL","hotelId":hid,
+            "hotelName":hotel["hotel_name"],"createdAt":ist_now().isoformat(),"TTL":ttl}
+    await set_session(phone, sess, ttl)
+    await set_room(room, f"PENDING:{phone}", ttl)
+    await db.insert_booking({"booking_id":bk_id,"room_number":room,"guest_name":name,
+        "guest_phone":phone,"checkin_date":ci,"checkout_date":co,
+        "payment_mode":"Pay at checkout","id_proof_type":idt,"id_proof_number":idn,
+        "id_proof_photo":idp,"id_proof_photo_back":idb,"guest_count":count,
+        "alternate_phone":alt,"hotel_id":hid})
+    if extra: await db.insert_additional_guests(bk_id, extra, hid)
+    if rate > 0:
+        await db.insert_stay_charge({"booking_id":bk_id,"charge_date":date.today(),
+            "service_type":"Room Rent","description":f"Room {room} — {nights} night(s)",
+            "amount":rate*nights,"total":rate*nights,"payment_status":"Pending","hotel_id":hid})
+    guests_txt = f"👤 {name} | {idt}: {idn}\n"
+    for i,ag in enumerate(extra):
+        guests_txt += f"👤 Guest {i+2}: {ag.get('name','')} | {ag.get('id_proof_type','')}: {ag.get('id_proof_number','')}\n"
+    from config.settings import BASE_URL
+    await send_to_phones(instance, staff_phones,
+        f"🔔 *NEW CHECK-IN REQUEST*\n━━━━━━━━━━━━━━━━━━\n"
+        f"🏨 {hotel['hotel_name']}\n🛏️ Room: *{room}*\n👥 Guests: {count}\n"
+        f"🔖 {bk_id}\n📅 {ci} → {co}\n📱 {phone}\n\n{guests_txt}"
+        f"━━━━━━━━━━━━━━━━━━\n✅ APPROVE {phone}\n❌ REJECT {phone}\n\n"
+        f"📊 Dashboard: {BASE_URL}/hotel/{slug}")
+    await send_text(instance, phone,
+        f"🏨 *Welcome to {hotel['hotel_name']}!*\n\n"
+        f"🙏 Namaste {name.split()[0]}!\n\nRoom *{room}* registration received.\n"
+        f"Booking ID: `{bk_id}`\n\n⏳ Waiting for reception approval. Keep your phone nearby! 🙏")
+    return JSONResponse({"success":True,"booking_id":bk_id})
+
+@router.get("/api/guest/session")
+async def api_session(phone: str = ""):
+    sess = await get_session(phone)
+    if not sess: return JSONResponse({"found":False})
+    return JSONResponse({"found":True,"name":sess.get("name"),"room":sess.get("room"),"booking_id":sess.get("bookingId"),"status":sess.get("status")})
+
+@router.get("/api/guest/charges")
+async def api_charges(booking_id: str = ""):
+    return JSONResponse({"charges": await db.get_charges_for_booking(booking_id)})
+
+@router.get("/api/guest/bill")
+async def api_bill(phone: str = "", slug: str = ""):
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: return JSONResponse({"found":False})
+    bk = await db.get_active_booking_by_phone(phone, hotel["id"])
+    if not bk: return JSONResponse({"found":False})
+    charges = await db.get_charges_for_booking(bk["booking_id"])
+    return JSONResponse({"found":True,"guest_name":bk["guest_name"],"room_number":bk["room_number"],
+        "booking_id":bk["booking_id"],"checkin_date":fmt_date(bk.get("checkin_date")),
+        "checkout_date":fmt_date(bk.get("checkout_date")),"charges":charges})
+
+@router.post("/api/guest/service")
+async def api_service(request: Request):
+    try: body = await request.json()
+    except: return JSONResponse({"success":False},400)
+    slug = body.get("slug","")
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: return JSONResponse({"success":False,"error":"Hotel not found"},404)
+    hid = hotel["id"]
+    phone = str(body.get("phone","")).strip()
+    room  = str(body.get("room","")).strip()
+    svc   = str(body.get("service","")).strip()
+    bid   = str(body.get("booking_id","")).strip()
+    cat, dept = categorize_service(svc)
+    sr_id = gen_sr()
+    price = await db.fetchval("SELECT price FROM services WHERE hotel_id=$1 AND LOWER(service_name)=LOWER($2) AND is_active=TRUE LIMIT 1",hid,svc) or 0
+    price = float(price)
+    await db.insert_service_request({"request_id":sr_id,"phone":phone,"booking_id":bid,"service_name":svc[:100],"category":cat,"department":dept,"price":price})
+    if price > 0 and bid:
+        await db.insert_stay_charge({"booking_id":bid,"charge_date":date.today(),"service_type":cat,"description":svc[:100],"amount":price,"total":price,"payment_status":"Pending","order_ref":sr_id,"hotel_id":hid})
+    dept_phone = await db.get_dept_phone(dept, hid)
+    staff_phones = await db.get_staff_phones(hid)
+    notify = [dept_phone] if dept_phone else staff_phones
+    await send_to_phones(hotel["instance_name"], notify,
+        f"🛎️ *SERVICE REQUEST*\n━━━━━━━━━━━━━━━━━━\n🏨 Room: *{room}*\n🔖 {sr_id}\n📋 *{svc}*\n{'💰 ₹'+str(int(price)) if price>0 else ''}\n\nReply *DONE {sr_id}* when done.")
+    await send_text(hotel["instance_name"], phone,
+        f"✅ *Request Received!*\n🛎️ {svc[:60]}\n🔖 {sr_id}\n\nOur team will attend shortly. 🙏")
+    return JSONResponse({"success":True,"request_id":sr_id})
