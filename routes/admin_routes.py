@@ -2,16 +2,25 @@
 routes/admin_routes.py — Master admin API (/api/admin/*)
 Only superadmin can access these.
 """
-from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi import APIRouter, Request, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse
 from services import database as db
 from services.auth import require_superadmin
+from services.audit import audit, list_audit
 from services.cache import get_room as cache_room
+import json
+import logging
 import secrets
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin")
 
 def sa(request: Request): return require_superadmin(request)
+
+
+def _actor(user) -> str:
+    if not user: return "system"
+    return str(user.get("username") or user.get("name") or user.get("user_id") or "admin")
 
 # ── Hotels CRUD ───────────────────────────────────────────────────
 @router.get("/hotels")
@@ -22,7 +31,7 @@ async def list_hotels(request: Request):
 
 @router.post("/hotels")
 async def create_hotel(request: Request):
-    await require_superadmin(request)
+    user = await require_superadmin(request)
     data = await request.json()
     if not data.get("hotel_name") or not data.get("slug") or not data.get("instance_name"):
         raise HTTPException(400, "hotel_name, slug and instance_name are required")
@@ -51,6 +60,10 @@ async def create_hotel(request: Request):
             "role": "owner", "username": data["owner_username"],
             "password": data["owner_password"]
         })
+    await audit("hotel.create", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hotel["id"], target=str(hotel["id"]),
+                payload={"name": hotel.get("hotel_name"), "slug": hotel.get("slug")},
+                request=request)
     return JSONResponse({"success": True, "hotel": hotel})
 
 @router.get("/hotels/{hid}")
@@ -65,15 +78,27 @@ async def get_hotel(hid: int, request: Request):
 
 @router.put("/hotels/{hid}")
 async def update_hotel(hid: int, request: Request):
-    await require_superadmin(request)
+    user = await require_superadmin(request)
     data = await request.json()
+    # Mask secrets in audit payload
+    audit_payload = {
+        k: ("***" if "secret" in k or "password" in k else v)
+        for k, v in (data or {}).items()
+    }
     hotel = await db.update_hotel(hid, data)
+    await audit("hotel.update", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(hid),
+                payload={"changed": list((data or {}).keys()), "values": audit_payload},
+                request=request)
     return JSONResponse({"success": True, "hotel": hotel})
 
 @router.delete("/hotels/{hid}")
 async def delete_hotel(hid: int, request: Request):
-    await require_superadmin(request)
+    """Soft delete: set is_active=FALSE, keep all history."""
+    user = await require_superadmin(request)
     await db.execute("UPDATE hotels SET is_active=FALSE WHERE id=$1", hid)
+    await audit("hotel.deactivate", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(hid), request=request)
     return JSONResponse({"success": True})
 
 # ── Hotel Users (staff management from master admin) ──────────────
@@ -98,8 +123,11 @@ async def update_user(hid: int, uid: int, request: Request):
 
 @router.delete("/hotels/{hid}/users/{uid}")
 async def delete_user(hid: int, uid: int, request: Request):
-    await require_superadmin(request)
+    """Soft delete via is_active=FALSE."""
+    user = await require_superadmin(request)
     await db.delete_hotel_user(uid)
+    await audit("hotel_user.delete", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(uid), request=request)
     return JSONResponse({"success": True})
 
 # ── Rooms ─────────────────────────────────────────────────────────
@@ -131,7 +159,7 @@ async def update_room_rate(hid: int, room_number: str, request: Request):
 
 @router.post("/hotels/{hid}/rooms/free")
 async def force_free_room(hid: int, request: Request):
-    await require_superadmin(request)
+    user = await require_superadmin(request)
     d = await request.json()
     room = d.get("room","")
     from services.cache import delete_session, delete_room, delete_pending, get_room
@@ -140,6 +168,9 @@ async def force_free_room(hid: int, request: Request):
         p = phone.replace("PENDING:","")
         await delete_session(p); await delete_room(room); await delete_pending(p)
     await db.set_room_vacant(room, hid)
+    await audit("ops.free_room", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=room, payload={"phone_was": phone or ""},
+                request=request)
     return JSONResponse({"success": True})
 
 # ── Services from admin ────────────────────────────────────────────
@@ -196,10 +227,254 @@ async def all_bookings(request: Request):
         bks = await db.fetch("SELECT b.*,COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Pending'),0) AS balance_due FROM bookings b LEFT JOIN stay_charges sc ON sc.booking_id=b.booking_id GROUP BY b.id ORDER BY b.created_at DESC LIMIT $1", limit)
     return JSONResponse({"bookings": bks})
 
-@router.get("/admin/password")
+@router.post("/admin/password")
 async def change_admin_password(request: Request):
-    await require_superadmin(request)
+    """Change the master admin password."""
+    user = await require_superadmin(request)
     d = await request.json()
-    user = await get_current_user(request)
-    await db.update_admin_password(user["user_id"], d.get("new_password",""))
+    new_pw = (d.get("new_password") or "").strip()
+    if not new_pw or len(new_pw) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+    await db.update_admin_password(user["user_id"], new_pw)
+    await audit("admin.password.change", actor=_actor(user), actor_role="superadmin",
+                target=str(user.get("user_id")), request=request)
+    return JSONResponse({"success": True, "message": "Password updated"})
+
+
+# ── Audit Log read API ────────────────────────────────────────────
+@router.get("/audit-log")
+async def audit_log_read(request: Request):
+    await require_superadmin(request)
+    qp = request.query_params
+    hid = None
+    try:
+        hid = int(qp.get("hotel_id")) if qp.get("hotel_id") else None
+    except Exception:
+        hid = None
+    prefix = qp.get("action_prefix") or None
+    limit = int(qp.get("limit") or 200)
+    rows = await list_audit(hotel_id=hid, action_prefix=prefix, limit=limit)
+    # Stringify timestamps so JSON serializes
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+    return JSONResponse({"entries": rows})
+
+
+# ══════════════════════════════════════════════════════════════════
+# HOUSEKEEPING
+# ══════════════════════════════════════════════════════════════════
+@router.get("/hotels/{hid}/housekeeping")
+async def hk_list(hid: int, request: Request):
+    await require_superadmin(request)
+    rooms = await db.list_housekeeping(hid)
+    log = await db.list_housekeeping_log(hid, limit=100)
+    # JSON-safe timestamps
+    for r in rooms:
+        if r.get("last_cleaned_at"):
+            r["last_cleaned_at"] = r["last_cleaned_at"].isoformat()
+    for e in log:
+        if e.get("created_at"):
+            e["created_at"] = e["created_at"].isoformat()
+    return JSONResponse({"rooms": rooms, "log": log})
+
+
+@router.post("/hotels/{hid}/housekeeping")
+async def hk_set(hid: int, request: Request):
+    user = await require_superadmin(request)
+    body = await request.json()
+    room = (body.get("room_number") or "").strip()
+    status = (body.get("status") or "").strip()
+    if not room or not status:
+        raise HTTPException(400, "room_number and status are required")
+    try:
+        await db.set_housekeeping_status(
+            hid, room, status,
+            cleaned_by=(body.get("cleaned_by") or _actor(user)),
+            notes=(body.get("notes") or ""),
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    await audit("housekeeping.set", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=room,
+                payload={"status": status, "notes": body.get("notes", "")},
+                request=request)
     return JSONResponse({"success": True})
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAINTENANCE TICKETS
+# ══════════════════════════════════════════════════════════════════
+@router.get("/hotels/{hid}/maintenance")
+async def mt_list(hid: int, request: Request):
+    await require_superadmin(request)
+    status = request.query_params.get("status") or None
+    rows = await db.list_maintenance(hid, status=status, limit=300)
+    for r in rows:
+        for k in ("reported_at", "resolved_at", "created_at", "updated_at"):
+            if r.get(k):
+                r[k] = r[k].isoformat()
+    return JSONResponse({"tickets": rows})
+
+
+@router.post("/hotels/{hid}/maintenance")
+async def mt_create(hid: int, request: Request):
+    user = await require_superadmin(request)
+    body = await request.json()
+    if not (body.get("title") or "").strip():
+        raise HTTPException(400, "title is required")
+    body.setdefault("reported_by", _actor(user))
+    ticket = await db.create_maintenance(hid, body)
+    await audit("maintenance.create", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(ticket.get("id", "")),
+                payload={"title": ticket.get("title"), "room": ticket.get("room_number"),
+                         "priority": ticket.get("priority")}, request=request)
+    if ticket.get("created_at"):
+        ticket["created_at"] = ticket["created_at"].isoformat()
+    if ticket.get("reported_at"):
+        ticket["reported_at"] = ticket["reported_at"].isoformat()
+    if ticket.get("updated_at"):
+        ticket["updated_at"] = ticket["updated_at"].isoformat()
+    return JSONResponse({"success": True, "ticket": ticket})
+
+
+@router.patch("/hotels/{hid}/maintenance/{tid}")
+async def mt_update(hid: int, tid: int, request: Request):
+    user = await require_superadmin(request)
+    body = await request.json()
+    ticket = await db.update_maintenance(tid, body)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+    await audit("maintenance.update", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(tid),
+                payload={k: v for k, v in body.items() if k in ("status", "priority", "assigned_to")},
+                request=request)
+    for k in ("reported_at", "resolved_at", "created_at", "updated_at"):
+        if ticket.get(k):
+            ticket[k] = ticket[k].isoformat()
+    return JSONResponse({"success": True, "ticket": ticket})
+
+
+@router.delete("/hotels/{hid}/maintenance/{tid}")
+async def mt_delete(hid: int, tid: int, request: Request):
+    """Soft delete via status='cancelled'."""
+    user = await require_superadmin(request)
+    await db.delete_maintenance(tid)
+    await audit("maintenance.cancel", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(tid), request=request)
+    return JSONResponse({"success": True})
+
+
+# ══════════════════════════════════════════════════════════════════
+# RAZORPAY WEBHOOK (signature verified)
+# ══════════════════════════════════════════════════════════════════
+@router.post("/razorpay-webhook/{slug}")
+async def razorpay_webhook(slug: str, request: Request, bg: BackgroundTasks):
+    """
+    Razorpay POSTs payment events here. We verify
+        HMAC_SHA256(hotels.razorpay_webhook_secret, raw_body)
+    against the X-Razorpay-Signature header before doing anything.
+
+    Until a hotel sets razorpay_webhook_secret in admin settings, we return 503
+    rather than process unauthenticated payment events. Configure it at
+    Settings → Razorpay Webhook Secret on the master admin dashboard.
+    """
+    from services.security import verify_razorpay_signature
+
+    raw = await request.body()
+    sig = request.headers.get("X-Razorpay-Signature", "") or \
+          request.headers.get("x-razorpay-signature", "")
+
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel or not hotel.get("is_active"):
+        # Don't leak which slugs exist — uniform 401 for unknown / inactive too
+        return JSONResponse({"error": "Invalid signature"}, status_code=401)
+
+    secret = (hotel.get("razorpay_webhook_secret") or "").strip()
+    if not secret:
+        await audit("razorpay.webhook.rejected_no_secret", actor_role="system",
+                    hotel_id=hotel["id"], target="razorpay",
+                    payload={"reason": "razorpay_webhook_secret not configured"},
+                    request=request)
+        return JSONResponse(
+            {"error": "Webhook secret not configured for this hotel."},
+            status_code=503,
+        )
+
+    if not verify_razorpay_signature(raw, sig, secret):
+        await audit("razorpay.webhook.rejected_bad_signature", actor_role="system",
+                    hotel_id=hotel["id"], target="razorpay",
+                    payload={"sig_present": bool(sig)}, request=request)
+        return JSONResponse({"error": "Invalid signature"}, status_code=401)
+
+    try:
+        body = json.loads(raw)
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    await audit("razorpay.webhook.accepted", actor_role="system",
+                hotel_id=hotel["id"], target=str(body.get("event", "")),
+                payload={"id": body.get("id", "")}, request=request)
+    bg.add_task(_handle_razorpay_event, hotel, body)
+    return JSONResponse({"status": "ok"})
+
+
+async def _handle_razorpay_event(hotel: dict, body: dict):
+    """
+    Process an authenticated Razorpay event in the background.
+    Currently handles `payment_link.paid` — marks the matching booking's
+    pending charges paid and notifies guest + staff.
+    """
+    try:
+        event = body.get("event", "")
+        if event != "payment_link.paid":
+            return
+        link = (body.get("payload", {}).get("payment_link") or {}).get("entity", {})
+        payment = (body.get("payload", {}).get("payment") or {}).get("entity", {})
+
+        notes = link.get("notes") or {}
+        bid = notes.get("booking_id") or ""
+        room = notes.get("room") or notes.get("room_number") or ""
+        phone = (link.get("customer") or {}).get("contact") or notes.get("phone", "")
+        amount = float(payment.get("amount", 0)) / 100.0
+        ref = payment.get("id") or link.get("id") or ""
+
+        if not bid:
+            # Try to find the active booking from room_number / phone
+            if phone:
+                row = await db.fetchrow(
+                    "SELECT booking_id, room_number, guest_name FROM bookings "
+                    "WHERE guest_phone=$1 AND status='Active' AND hotel_id=$2 LIMIT 1",
+                    phone, hotel["id"],
+                )
+                if row:
+                    bid = row["booking_id"]
+                    room = room or row["room_number"]
+
+        if not bid:
+            logger.warning("razorpay event missing booking ref: %s", body.get("id", ""))
+            return
+
+        await db.mark_charges_paid(bid, "Online", ref)
+        await db.insert_payment_log({
+            "booking_id": bid, "guest_phone": phone, "room_number": room,
+            "guest_name": "", "amount": amount, "payment_method": "Online",
+            "reference": ref, "hotel_id": hotel["id"],
+        })
+        await db.execute(
+            "UPDATE bookings SET total_paid = COALESCE(total_paid,0) + $1, updated_at=NOW() "
+            "WHERE booking_id=$2",
+            amount, bid,
+        )
+
+        # Notify guest + staff
+        from services.whatsapp import send_text, send_to_phones
+        if phone:
+            await send_text(hotel["instance_name"], phone,
+                f"✅ *Payment Received!*\n💰 ₹{amount:.0f} captured.\n"
+                f"🔖 {bid}\nThank you! 🙏")
+        staff_phones = await db.get_staff_phones(hotel["id"])
+        await send_to_phones(hotel["instance_name"], staff_phones,
+            f"✅ *RAZORPAY PAID*\n🔖 {bid} | Room {room}\n💰 ₹{amount:.0f}\nRef: {ref}")
+    except Exception as e:
+        logger.exception("razorpay handler failed: %s", e)

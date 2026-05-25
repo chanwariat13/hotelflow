@@ -157,6 +157,86 @@ async def ensure_admin_seed():
         # Never block startup over the seed; just log it loudly.
         logger.exception("ensure_admin_seed failed: %s", e)
 
+
+async def ensure_schema_v2():
+    """
+    Idempotent schema upgrade. Runs on every startup. Creates new tables and
+    adds new columns if they don't already exist. Never drops or renames anything.
+
+    Adds:
+      - audit_log:           append-only privileged-action log
+      - housekeeping_log:    cleaning history per room
+      - maintenance_tickets: room/area maintenance tracking
+      - hotels.gstin                    (B2B tax invoice)
+      - hotels.razorpay_webhook_secret  (for signed webhook)
+      - bookings.customer_gstin         (B2B guest GSTIN on bill)
+      - rooms.housekeeping_status / last_cleaned_by / last_cleaned_at
+    """
+    try:
+        # 1. New tables
+        await execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id          SERIAL PRIMARY KEY,
+                hotel_id    INTEGER,
+                actor       VARCHAR(200) DEFAULT '',
+                actor_role  VARCHAR(50)  DEFAULT '',
+                action      VARCHAR(100) DEFAULT '',
+                target      VARCHAR(200) DEFAULT '',
+                payload     TEXT         DEFAULT '',
+                ip          VARCHAR(100) DEFAULT '',
+                user_agent  VARCHAR(300) DEFAULT '',
+                created_at  TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_audit_hotel_created ON audit_log(hotel_id, created_at DESC)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_audit_action        ON audit_log(action)")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS housekeeping_log (
+                id            SERIAL PRIMARY KEY,
+                hotel_id      INTEGER NOT NULL,
+                room_number   VARCHAR(20) NOT NULL,
+                status        VARCHAR(30) NOT NULL,   -- dirty / cleaning / clean / inspected / maintenance
+                cleaned_by    VARCHAR(100) DEFAULT '',
+                notes         TEXT DEFAULT '',
+                created_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_hk_hotel_room ON housekeeping_log(hotel_id, room_number, created_at DESC)")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS maintenance_tickets (
+                id            SERIAL PRIMARY KEY,
+                hotel_id      INTEGER NOT NULL,
+                room_number   VARCHAR(20) DEFAULT '',
+                title         VARCHAR(200) NOT NULL,
+                description   TEXT DEFAULT '',
+                priority      VARCHAR(20) DEFAULT 'normal',   -- low / normal / high / urgent
+                status        VARCHAR(20) DEFAULT 'open',     -- open / in_progress / resolved / cancelled
+                assigned_to   VARCHAR(100) DEFAULT '',
+                reported_by   VARCHAR(100) DEFAULT '',
+                reported_at   TIMESTAMP DEFAULT NOW(),
+                resolved_at   TIMESTAMP,
+                resolution    TEXT DEFAULT '',
+                created_at    TIMESTAMP DEFAULT NOW(),
+                updated_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_mt_hotel_status ON maintenance_tickets(hotel_id, status)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_mt_room         ON maintenance_tickets(room_number)")
+
+        # 2. New columns on existing tables
+        await execute("ALTER TABLE hotels   ADD COLUMN IF NOT EXISTS gstin                   VARCHAR(20)  DEFAULT ''")
+        await execute("ALTER TABLE hotels   ADD COLUMN IF NOT EXISTS razorpay_webhook_secret VARCHAR(200) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_gstin          VARCHAR(20)  DEFAULT ''")
+        await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS housekeeping_status     VARCHAR(20)  DEFAULT 'clean'")
+        await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_by         VARCHAR(100) DEFAULT ''")
+        await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_at         TIMESTAMP")
+
+        logger.info("✅ schema_v2 ensured (audit_log, housekeeping_log, maintenance_tickets, gstin, webhook_secret)")
+    except Exception as e:
+        logger.exception("ensure_schema_v2 failed: %s", e)
+
 # ══════════════════════════════════════════════════════════════════
 # HOTELS
 # ══════════════════════════════════════════════════════════════════
@@ -231,6 +311,7 @@ async def update_hotel(hid: int, data: Dict) -> Optional[Dict]:
         "google_maps_url","hotel_email","hotel_whatsapp","check_in_time","checkout_time_display",
         "welcome_message","footer_text","google_review_url","menu_url","emergency_number",
         "wifi_name","wifi_password","payment_mode","razorpay_key_id","razorpay_secret",
+        "razorpay_webhook_secret","gstin",
         "upi_id","upi_display_name","gotenberg_url","cloudinary_cloud_name","cloudinary_upload_preset",
         "staff_phones","report_phones","checkout_hour","late_charge_flat","late_fee_per_hour",
         "max_late_fee","svc_open_hour","svc_close_hour","sched_daily_report_hour",
@@ -451,15 +532,16 @@ async def insert_booking(d: Dict):
         INSERT INTO bookings (booking_id,room_number,guest_name,guest_phone,
             checkin_date,checkout_date,status,payment_mode,
             id_proof_type,id_proof_number,id_proof_photo,id_proof_photo_back,
-            guest_count,alternate_phone,hotel_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            guest_count,alternate_phone,hotel_id,customer_gstin)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
         ON CONFLICT (booking_id) DO NOTHING""",
         d["booking_id"],d["room_number"],d["guest_name"],d["guest_phone"],
         d["checkin_date"],d["checkout_date"],d.get("status","Active"),
         d.get("payment_mode","Pay at checkout"),
         d.get("id_proof_type",""),d.get("id_proof_number",""),
         d.get("id_proof_photo",""),d.get("id_proof_photo_back",""),
-        d.get("guest_count",1),d.get("alternate_phone",""),d.get("hotel_id",1))
+        d.get("guest_count",1),d.get("alternate_phone",""),d.get("hotel_id",1),
+        d.get("customer_gstin",""))
 
 async def checkout_booking(room: str, hid: int):
     await execute("UPDATE bookings SET status='CheckedOut',updated_at=NOW() WHERE room_number=$1 AND status='Active' AND hotel_id=$2", room, hid)
@@ -627,3 +709,180 @@ async def get_top_food(hid: int) -> List[Dict]:
         WHERE sc.service_type='Food' AND b.hotel_id=$1
           AND DATE_TRUNC('month',sc.created_at)=DATE_TRUNC('month',CURRENT_DATE-INTERVAL '1 day')
         GROUP BY description ORDER BY order_count DESC LIMIT 3""", hid)
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# HOUSEKEEPING — room cleaning / inspection workflow
+# ══════════════════════════════════════════════════════════════════
+HK_STATUSES = ("dirty", "cleaning", "clean", "inspected", "maintenance")
+
+
+async def list_housekeeping(hid: int) -> List[Dict]:
+    """Snapshot of every room with its current housekeeping status."""
+    return await fetch(
+        """SELECT id, room_number, room_type, floor, status AS room_status,
+                  COALESCE(housekeeping_status,'clean') AS housekeeping_status,
+                  last_cleaned_by, last_cleaned_at
+           FROM rooms WHERE hotel_id=$1 ORDER BY room_number""",
+        hid,
+    )
+
+
+async def list_housekeeping_log(hid: int, limit: int = 200) -> List[Dict]:
+    return await fetch(
+        """SELECT id, room_number, status, cleaned_by, notes, created_at
+           FROM housekeeping_log WHERE hotel_id=$1
+           ORDER BY id DESC LIMIT $2""",
+        hid, limit,
+    )
+
+
+async def set_housekeeping_status(
+    hid: int, room_number: str, status: str,
+    cleaned_by: str = "", notes: str = ""
+):
+    """
+    Update a room's housekeeping_status and append to history. status must be
+    one of HK_STATUSES — invalid values are rejected so the UI can't smuggle
+    arbitrary strings into the DB.
+    """
+    if status not in HK_STATUSES:
+        raise ValueError(f"invalid housekeeping status '{status}' (allowed: {HK_STATUSES})")
+    await execute(
+        """UPDATE rooms
+           SET housekeeping_status=$1,
+               last_cleaned_by = CASE WHEN $1 IN ('clean','inspected') THEN $2 ELSE last_cleaned_by END,
+               last_cleaned_at = CASE WHEN $1 IN ('clean','inspected') THEN NOW() ELSE last_cleaned_at END,
+               updated_at = NOW()
+           WHERE room_number=$3 AND hotel_id=$4""",
+        status, cleaned_by, room_number, hid,
+    )
+    await execute(
+        """INSERT INTO housekeeping_log (hotel_id, room_number, status, cleaned_by, notes)
+           VALUES ($1, $2, $3, $4, $5)""",
+        hid, room_number, status, cleaned_by, notes,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAINTENANCE TICKETS
+# ══════════════════════════════════════════════════════════════════
+MT_STATUSES   = ("open", "in_progress", "resolved", "cancelled")
+MT_PRIORITIES = ("low", "normal", "high", "urgent")
+
+
+async def list_maintenance(hid: int, status: Optional[str] = None,
+                            limit: int = 200) -> List[Dict]:
+    if status:
+        if status not in MT_STATUSES:
+            return []
+        return await fetch(
+            """SELECT * FROM maintenance_tickets
+               WHERE hotel_id=$1 AND status=$2
+               ORDER BY CASE priority
+                          WHEN 'urgent' THEN 1 WHEN 'high' THEN 2
+                          WHEN 'normal' THEN 3 ELSE 4 END,
+                        id DESC LIMIT $3""",
+            hid, status, limit,
+        )
+    return await fetch(
+        """SELECT * FROM maintenance_tickets
+           WHERE hotel_id=$1
+           ORDER BY CASE WHEN status IN ('open','in_progress') THEN 0 ELSE 1 END,
+                    CASE priority
+                      WHEN 'urgent' THEN 1 WHEN 'high' THEN 2
+                      WHEN 'normal' THEN 3 ELSE 4 END,
+                    id DESC LIMIT $2""",
+        hid, limit,
+    )
+
+
+async def get_maintenance(tid: int) -> Optional[Dict]:
+    return await fetchrow("SELECT * FROM maintenance_tickets WHERE id=$1", tid)
+
+
+async def create_maintenance(hid: int, data: Dict) -> Dict:
+    priority = data.get("priority", "normal")
+    if priority not in MT_PRIORITIES:
+        priority = "normal"
+    row = await fetchrow(
+        """INSERT INTO maintenance_tickets
+           (hotel_id, room_number, title, description, priority,
+            status, assigned_to, reported_by)
+           VALUES ($1,$2,$3,$4,$5,'open',$6,$7) RETURNING *""",
+        hid,
+        (data.get("room_number") or "").strip(),
+        (data.get("title") or "").strip()[:200],
+        data.get("description") or "",
+        priority,
+        (data.get("assigned_to") or "").strip(),
+        (data.get("reported_by") or "").strip(),
+    )
+    return dict(row) if row else {}
+
+
+async def update_maintenance(tid: int, data: Dict) -> Optional[Dict]:
+    """Update title/description/priority/status/assigned_to/resolution."""
+    allowed = ("title", "description", "priority", "status",
+               "assigned_to", "resolution")
+    fields, vals, i = [], [], 1
+    for k, v in data.items():
+        if k not in allowed:
+            continue
+        if k == "priority" and v not in MT_PRIORITIES:
+            continue
+        if k == "status" and v not in MT_STATUSES:
+            continue
+        fields.append(f"{k}=${i}")
+        vals.append(v)
+        i += 1
+    if not fields:
+        return await get_maintenance(tid)
+    fields.append("updated_at=NOW()")
+    if data.get("status") == "resolved":
+        fields.append("resolved_at=NOW()")
+    vals.append(tid)
+    return await fetchrow(
+        f"UPDATE maintenance_tickets SET {','.join(fields)} WHERE id=${i} RETURNING *",
+        *vals,
+    )
+
+
+async def delete_maintenance(tid: int):
+    """Soft delete via status='cancelled' — preserves history."""
+    await execute(
+        "UPDATE maintenance_tickets SET status='cancelled', updated_at=NOW() WHERE id=$1",
+        tid,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# RETURNING GUEST LOOKUP (auto-fill registration)
+# ══════════════════════════════════════════════════════════════════
+async def lookup_returning_guest(hid: int, phone: str) -> Optional[Dict]:
+    """
+    If this phone has stayed at this hotel before, return the most recent
+    booking summary so the registration page can auto-fill name + ID type.
+    Never returns sensitive ID numbers / photo URLs — UI fills them fresh.
+    """
+    if not phone or len(phone) < 10:
+        return None
+    row = await fetchrow(
+        """SELECT guest_name, id_proof_type,
+                  COUNT(*)        OVER () AS total_visits,
+                  MAX(checkin_date) OVER () AS last_visit
+           FROM bookings
+           WHERE guest_phone=$1 AND hotel_id=$2
+           ORDER BY created_at DESC LIMIT 1""",
+        phone, hid,
+    )
+    if not row:
+        return None
+    return {
+        "found": True,
+        "name": row["guest_name"] or "",
+        "id_proof_type": row["id_proof_type"] or "",
+        "total_visits": int(row["total_visits"] or 0),
+        "last_visit": row["last_visit"].isoformat() if row.get("last_visit") else "",
+    }

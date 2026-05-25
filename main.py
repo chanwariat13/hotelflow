@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import logging, os
 
 from config.settings import HOST, PORT
-from services.database import get_pool, close_pool, ensure_admin_seed
+from services.database import get_pool, close_pool, ensure_admin_seed, ensure_schema_v2
 from services.cache import get_redis, close_redis
 from scheduler.setup import start_scheduler, stop_scheduler
 from routes.bot import router as bot_router
@@ -27,6 +27,7 @@ async def lifespan(app: FastAPI):
     logger.info("🏨 HotelFlow v2 starting...")
     await get_pool()
     await get_redis()
+    await ensure_schema_v2()
     await ensure_admin_seed()
     await start_scheduler()
     logger.info("✅ HotelFlow is ready!")
