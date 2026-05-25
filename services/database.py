@@ -76,10 +76,13 @@ async def ensure_admin_seed():
     3. If no admin user exists at all, create one with those credentials.
     4. If the existing admin still has the known-broken legacy seed hash, repair it
        using the env-provided password.
-    5. If ADMIN_PASSWORD_RESET is truthy, force-reset the password to ADMIN_PASSWORD
-       on boot. This is for emergency recovery — set it once in Coolify, redeploy,
-       log in, then unset it.
-    6. Otherwise leave the existing user alone (user-managed password wins).
+    5. If ADMIN_PASSWORD is set AND the current password is still the weak default
+       'admin123', auto-upgrade to the env password. This is the common path when an
+       operator sets a strong password after the row was seeded with the default.
+    6. If ADMIN_PASSWORD_RESET is truthy, force-reset the password to ADMIN_PASSWORD
+       on boot. This is for emergency recovery — set it once, redeploy, log in,
+       then unset it.
+    7. Otherwise leave the existing user alone (user-managed password wins).
     """
     username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
     password = os.getenv("ADMIN_PASSWORD", "admin123")
@@ -125,6 +128,21 @@ async def ensure_admin_seed():
                 "Detected broken legacy admin seed; reset '%s' to %s.",
                 username,
                 "ADMIN_PASSWORD env" if not is_default_pw else "default 'admin123' (please set ADMIN_PASSWORD)",
+            )
+            return
+
+        # Auto-upgrade weak default password whenever a custom one is provided.
+        # This handles the case where the admin row was previously seeded with
+        # 'admin123' and the operator later sets ADMIN_PASSWORD in their env.
+        if not is_default_pw and verify_password("admin123", row["password_hash"]):
+            await execute(
+                "UPDATE admin_users SET password_hash=$1 WHERE id=$2",
+                hash_password(password), row["id"],
+            )
+            logger.warning(
+                "Detected weak default password 'admin123' for admin '%s'; "
+                "auto-upgraded to ADMIN_PASSWORD from env.",
+                username,
             )
             return
 
