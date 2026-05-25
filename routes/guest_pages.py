@@ -243,9 +243,12 @@ async def menu_page(slug: str, request: Request):
             p = float(s.get("price",0))
             ps = f"₹{p:.0f}" if p>0 else "Free"
             desc = s.get("description","") or ""
-            svc_html += f"""<div class="scard" onclick="reqSvc('{s['service_name'].replace("'","\\'")}',{p})">
+            sname = s['service_name']
+            sname_js = sname.replace("\\", "\\\\").replace("'", "\\'")
+            desc_html = f'<div style="font-size:11px;opacity:.55;margin-top:2px">{desc}</div>' if desc else ''
+            svc_html += f"""<div class="scard" onclick="reqSvc('{sname_js}',{p})">
               <div style="display:flex;justify-content:space-between;align-items:center">
-                <div><b style="font-size:14px">{s['service_name']}</b>{f'<div style="font-size:11px;opacity:.55;margin-top:2px">{desc}</div>' if desc else ''}</div>
+                <div><b style="font-size:14px">{sname}</b>{desc_html}</div>
                 <span style="font-weight:600;color:{pri};white-space:nowrap;margin-left:10px">{ps}</span>
               </div></div>"""
 
