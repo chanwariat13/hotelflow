@@ -1,3 +1,4 @@
+import os
 import asyncpg, logging
 from config.settings import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS
 from typing import Optional, List, Dict
@@ -56,15 +57,36 @@ async def update_admin_password(admin_id: int, new_password: str):
 # It will never verify under sha256(salt||pw), so we auto-repair it on startup.
 _BROKEN_ADMIN_HASH = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3:defaultsalt"
 
-async def ensure_admin_seed(default_username: str = "admin", default_password: str = "admin123"):
+
+def _truthy(val: Optional[str]) -> bool:
+    return (val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+async def ensure_admin_seed():
     """
     Boot-time self-heal for the master admin login.
 
-    1. Make sure the admin_users table exists (in case migration.sql wasn't run).
-    2. If no admin user exists at all, create one with default credentials.
-    3. If the existing admin still has the known-broken seed hash, repair it.
-       Rows that have been changed by the user are left untouched.
+    Reads from env:
+      - ADMIN_USERNAME       (default "admin")
+      - ADMIN_PASSWORD       (default "admin123" — weak, only used if env not set)
+      - ADMIN_PASSWORD_RESET (truthy = force-reset password on this boot)
+
+    Behaviour:
+      1. Ensure admin_users table exists.
+      2. Create the admin user with env credentials if it doesn't exist.
+      3. Repair the known-broken legacy seed hash to the env password.
+      4. If the row currently uses the weak default 'admin123' AND a
+         non-default ADMIN_PASSWORD is set in env, auto-upgrade to the env
+         password (so operators don't have to do anything special after
+         setting ADMIN_PASSWORD in Coolify).
+      5. ADMIN_PASSWORD_RESET=1 force-resets even a custom password.
+      6. Otherwise leave the existing user alone (UI-managed password wins).
     """
+    username = os.getenv("ADMIN_USERNAME", "admin").strip() or "admin"
+    password = os.getenv("ADMIN_PASSWORD", "admin123")
+    force_reset = _truthy(os.getenv("ADMIN_PASSWORD_RESET"))
+    is_default_pw = (password == "admin123")
+
     try:
         await execute("""
             CREATE TABLE IF NOT EXISTS admin_users (
@@ -77,28 +99,60 @@ async def ensure_admin_seed(default_username: str = "admin", default_password: s
             )
         """)
 
-        row = await fetchrow("SELECT id, password_hash FROM admin_users WHERE username=$1", default_username)
+        row = await fetchrow("SELECT id, password_hash FROM admin_users WHERE username=$1", username)
+
         if not row:
             await execute(
                 "INSERT INTO admin_users (username, password_hash, name) VALUES ($1, $2, 'Super Admin')",
-                default_username, hash_password(default_password),
+                username, hash_password(password),
             )
-            logger.warning(
-                "Seeded default admin user '%s' with password '%s'. CHANGE IT AFTER LOGIN.",
-                default_username, default_password,
-            )
+            if is_default_pw:
+                logger.warning(
+                    "Seeded default admin '%s' with WEAK password 'admin123'. "
+                    "Set ADMIN_PASSWORD env var to a strong password and redeploy.",
+                    username,
+                )
+            else:
+                logger.info("Seeded admin user '%s' from ADMIN_PASSWORD env var.", username)
             return
 
         if row["password_hash"] == _BROKEN_ADMIN_HASH:
             await execute(
                 "UPDATE admin_users SET password_hash=$1 WHERE id=$2",
-                hash_password(default_password), row["id"],
+                hash_password(password), row["id"],
             )
             logger.warning(
-                "Detected broken admin password seed; reset '%s' to default password '%s'. "
-                "CHANGE IT AFTER LOGIN.",
-                default_username, default_password,
+                "Detected broken legacy admin seed; reset '%s' to %s.",
+                username,
+                "ADMIN_PASSWORD env" if not is_default_pw else "default 'admin123' (please set ADMIN_PASSWORD)",
             )
+            return
+
+        # Auto-upgrade weak default password whenever a custom one is provided.
+        if not is_default_pw and verify_password("admin123", row["password_hash"]):
+            await execute(
+                "UPDATE admin_users SET password_hash=$1 WHERE id=$2",
+                hash_password(password), row["id"],
+            )
+            logger.warning(
+                "Detected weak default password 'admin123' for admin '%s'; "
+                "auto-upgraded to ADMIN_PASSWORD from env.",
+                username,
+            )
+            return
+
+        if force_reset:
+            await execute(
+                "UPDATE admin_users SET password_hash=$1 WHERE id=$2",
+                hash_password(password), row["id"],
+            )
+            logger.warning(
+                "ADMIN_PASSWORD_RESET=1 — force-reset password for '%s'. "
+                "Unset ADMIN_PASSWORD_RESET after logging in.",
+                username,
+            )
+            return
+
     except Exception as e:
         # Never block startup over the seed; just log it loudly.
         logger.exception("ensure_admin_seed failed: %s", e)
