@@ -4,7 +4,130 @@
 -- psql -U postgres -d your_db -f migration.sql
 -- ═══════════════════════════════════════════════════════════════════
 
--- ── 1. Add hotel_id to all existing tables (safe) ────────────────
+-- ── 0. Base tables (created on fresh DBs; no-op if they already exist) ──
+-- Older deploys had these tables created by an earlier private migration
+-- that no longer ships in the repo. To make `psql -f migration.sql` work
+-- on a brand new database, we create them here. They use IF NOT EXISTS,
+-- so an already-populated database is left untouched and the ADD COLUMN
+-- statements in section 1 take care of any drift.
+
+CREATE TABLE IF NOT EXISTS bookings (
+    id                   SERIAL PRIMARY KEY,
+    booking_id           VARCHAR(40)  NOT NULL UNIQUE,
+    hotel_id             INTEGER      NOT NULL DEFAULT 1,
+    room_number          VARCHAR(20)  NOT NULL DEFAULT '',
+    guest_name           VARCHAR(200) NOT NULL DEFAULT '',
+    guest_phone          VARCHAR(20)  NOT NULL DEFAULT '',
+    alternate_phone      VARCHAR(20)  DEFAULT '',
+    guest_count          INTEGER      DEFAULT 1,
+    checkin_date         TIMESTAMP,
+    checkout_date        TIMESTAMP,
+    status               VARCHAR(20)  DEFAULT 'Active', -- Active/Reserved/CheckedIn/CheckedOut/Rejected/Cancelled
+    payment_mode         VARCHAR(40)  DEFAULT 'Pay at checkout',
+    id_proof_type        VARCHAR(40)  DEFAULT '',
+    id_proof_number      VARCHAR(80)  DEFAULT '',
+    id_proof_photo       TEXT         DEFAULT '',
+    id_proof_photo_back  TEXT         DEFAULT '',
+    total_paid           NUMERIC(12,2) DEFAULT 0,
+    created_at           TIMESTAMP    DEFAULT NOW(),
+    updated_at           TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS rooms (
+    id            SERIAL PRIMARY KEY,
+    hotel_id      INTEGER      NOT NULL DEFAULT 1,
+    room_number   VARCHAR(20)  NOT NULL,
+    room_type     VARCHAR(60)  DEFAULT 'Standard',
+    floor         INTEGER      DEFAULT 1,
+    room_rate     NUMERIC(10,2) DEFAULT 0,
+    qr_secret     VARCHAR(32)  DEFAULT '',
+    status        VARCHAR(20)  DEFAULT 'Vacant', -- Vacant / Occupied
+    created_at    TIMESTAMP    DEFAULT NOW(),
+    updated_at    TIMESTAMP    DEFAULT NOW(),
+    UNIQUE (hotel_id, room_number)
+);
+
+CREATE TABLE IF NOT EXISTS stay_charges (
+    id              SERIAL PRIMARY KEY,
+    hotel_id        INTEGER      NOT NULL DEFAULT 1,
+    booking_id      VARCHAR(40)  NOT NULL,
+    charge_date     TIMESTAMP    DEFAULT NOW(),
+    service_type    VARCHAR(60)  NOT NULL DEFAULT 'Other',
+    description     TEXT         DEFAULT '',
+    amount          NUMERIC(10,2) DEFAULT 0,
+    tax             NUMERIC(10,2) DEFAULT 0,
+    total           NUMERIC(10,2) DEFAULT 0,
+    payment_status  VARCHAR(20)  DEFAULT 'Pending', -- Pending/Paid/Cancelled/Waived
+    payment_method  VARCHAR(20)  DEFAULT '',
+    order_ref       VARCHAR(120) DEFAULT '',
+    created_at      TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS payment_logs (
+    id             SERIAL PRIMARY KEY,
+    hotel_id       INTEGER      NOT NULL DEFAULT 1,
+    booking_id     VARCHAR(40)  NOT NULL DEFAULT '',
+    guest_phone    VARCHAR(20)  DEFAULT '',
+    room_number    VARCHAR(20)  DEFAULT '',
+    guest_name     VARCHAR(200) DEFAULT '',
+    amount         NUMERIC(10,2) DEFAULT 0,
+    payment_method VARCHAR(40)  DEFAULT '',
+    reference      VARCHAR(120) DEFAULT '',
+    payment_date   TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS services (
+    id            SERIAL PRIMARY KEY,
+    hotel_id      INTEGER      NOT NULL DEFAULT 1,
+    service_name  VARCHAR(150) NOT NULL,
+    category      VARCHAR(60)  DEFAULT 'Other',
+    price         NUMERIC(10,2) DEFAULT 0,
+    department    VARCHAR(60)  DEFAULT 'Reception',
+    description   TEXT         DEFAULT '',
+    is_active     BOOLEAN      DEFAULT TRUE,
+    created_at    TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS staff_departments (
+    id              SERIAL PRIMARY KEY,
+    hotel_id        INTEGER      NOT NULL DEFAULT 1,
+    department      VARCHAR(60)  NOT NULL,
+    display_name    VARCHAR(100) DEFAULT '',
+    whatsapp_number VARCHAR(20)  DEFAULT '',
+    is_active       BOOLEAN      DEFAULT TRUE,
+    created_at      TIMESTAMP    DEFAULT NOW(),
+    UNIQUE (hotel_id, department)
+);
+
+CREATE TABLE IF NOT EXISTS service_requests (
+    id            SERIAL PRIMARY KEY,
+    hotel_id      INTEGER      NOT NULL DEFAULT 1,
+    request_id    VARCHAR(40)  NOT NULL UNIQUE,
+    booking_id    VARCHAR(40)  DEFAULT '',
+    service_name  VARCHAR(150) DEFAULT '',
+    category      VARCHAR(60)  DEFAULT '',
+    department    VARCHAR(60)  DEFAULT '',
+    status        VARCHAR(20)  DEFAULT 'Pending', -- Pending / Completed / Cancelled
+    priority      VARCHAR(20)  DEFAULT 'Normal',
+    guest_note    TEXT         DEFAULT '',
+    charge_amount NUMERIC(10,2) DEFAULT 0,
+    requested_at  TIMESTAMP    DEFAULT NOW(),
+    completed_at  TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS additional_booking_guests (
+    id                   SERIAL PRIMARY KEY,
+    hotel_id             INTEGER      NOT NULL DEFAULT 1,
+    booking_id           VARCHAR(40)  NOT NULL,
+    guest_name           VARCHAR(200) DEFAULT '',
+    id_proof_type        VARCHAR(40)  DEFAULT '',
+    id_proof_number      VARCHAR(80)  DEFAULT '',
+    id_proof_photo       TEXT         DEFAULT '',
+    id_proof_photo_back  TEXT         DEFAULT '',
+    created_at           TIMESTAMP    DEFAULT NOW()
+);
+
+-- ── 1. Add hotel_id to all existing tables (safe; no-op on fresh DBs) ──
 ALTER TABLE bookings                  ADD COLUMN IF NOT EXISTS hotel_id INTEGER DEFAULT 1;
 ALTER TABLE rooms                     ADD COLUMN IF NOT EXISTS hotel_id INTEGER DEFAULT 1;
 ALTER TABLE stay_charges              ADD COLUMN IF NOT EXISTS hotel_id INTEGER DEFAULT 1;
@@ -13,6 +136,51 @@ ALTER TABLE services                  ADD COLUMN IF NOT EXISTS hotel_id INTEGER 
 ALTER TABLE staff_departments         ADD COLUMN IF NOT EXISTS hotel_id INTEGER DEFAULT 1;
 ALTER TABLE service_requests          ADD COLUMN IF NOT EXISTS hotel_id INTEGER DEFAULT 1;
 ALTER TABLE additional_booking_guests ADD COLUMN IF NOT EXISTS hotel_id INTEGER DEFAULT 1;
+
+-- Columns referenced from the application that the legacy schema may not have.
+-- These were silently missing in older deploys; adding them here makes
+-- payment + accounting code actually work end-to-end.
+ALTER TABLE bookings     ADD COLUMN IF NOT EXISTS total_paid     NUMERIC(12,2) DEFAULT 0;
+ALTER TABLE bookings     ADD COLUMN IF NOT EXISTS updated_at     TIMESTAMP DEFAULT NOW();
+ALTER TABLE rooms        ADD COLUMN IF NOT EXISTS updated_at     TIMESTAMP DEFAULT NOW();
+ALTER TABLE stay_charges ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20)  DEFAULT '';
+ALTER TABLE stay_charges ADD COLUMN IF NOT EXISTS order_ref      VARCHAR(120) DEFAULT '';
+
+-- Multi-tenant safety: rooms must be unique per (hotel_id, room_number),
+-- not globally by room_number. The original DROP-and-recreate is unsafe on
+-- live data, so we only add the composite unique constraint if it isn't
+-- there yet — leaving any pre-existing global UNIQUE in place. The matching
+-- ON CONFLICT clause in services.database.upsert_room references this name.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'rooms_hotel_room_unique'
+    ) THEN
+        BEGIN
+            ALTER TABLE rooms
+                ADD CONSTRAINT rooms_hotel_room_unique UNIQUE (hotel_id, room_number);
+        EXCEPTION WHEN duplicate_table OR duplicate_object THEN
+            -- already exists under a different name; ignore
+            NULL;
+        END;
+    END IF;
+END $$;
+
+-- Legacy schemas had a single-column UNIQUE on rooms.room_number which
+-- prevented two hotels from sharing a "101". The composite key above
+-- supersedes it, so drop the legacy constraint if we can detect it.
+-- Best-effort: only drops the standard auto-generated name; custom names
+-- must be removed manually.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'rooms_room_number_key'
+    ) THEN
+        ALTER TABLE rooms DROP CONSTRAINT rooms_room_number_key;
+    END IF;
+END $$;
 
 -- ── 2. Hotels table (full branding + config) ──────────────────────
 CREATE TABLE IF NOT EXISTS hotels (

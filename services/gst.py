@@ -35,7 +35,10 @@ from typing import Optional, Tuple
 HSN_ROOM       = "996311"
 HSN_RESTAURANT = "996331"
 HSN_LAUNDRY    = "999719"
-HSN_TRANSPORT  = "996601"
+# 996421 = "Passenger transport services" (the canonical SAC for transferring
+# guests in/out by car/cab). The previous value "996601" did not exist in the
+# CGST SAC schedule and would be rejected by GST returns / Tally.
+HSN_TRANSPORT  = "996421"
 HSN_OTHER      = "999799"
 
 SERVICE_TO_HSN = {
