@@ -367,15 +367,20 @@ CREATE INDEX IF NOT EXISTS idx_food_orders_room    ON hotel_food_orders(room_num
 -- to insert a row. See services/database.py for details.
 -- (Intentionally no INSERT INTO admin_users here — set ADMIN_PASSWORD in env.)
 
--- ── 7. Seed your existing hotel (safe, skips if exists) ───────────
-INSERT INTO hotels (hotel_name, slug, instance_name, primary_color, secondary_color,
-    emergency_number, wifi_name, wifi_password, payment_mode,
-    staff_phones, report_phones, checkout_hour, late_charge_flat, gotenberg_url, is_active)
-VALUES ('Grand Stay Hotel', 'grand-stay', 'Propertybaajar',
-    '#c8a84b', '#1a2942', '917340226277', 'HotelWifi', 'wifi@123',
-    'razorpay', ARRAY['917340226277','917413049091'],
-    ARRAY['917340226277','917413049091'], 11, 500, 'http://localhost:3000', TRUE)
-ON CONFLICT (slug) DO NOTHING;
+-- ── 7. NO seed hotel ──────────────────────────────────────────────
+-- Older versions of this migration auto-inserted a "Grand Stay Hotel"
+-- (slug='grand-stay', instance='Propertybaajar') so the master dashboard
+-- had something to render on a brand-new install. That left every fresh
+-- deploy showing "Active Hotels: 1 of 1" before the operator had added
+-- anything, which looked like a counter bug. We now leave the hotels
+-- table empty on first boot — operators add their first hotel through
+-- /admin → "+ Add New Hotel".
+--
+-- Existing deployments that already received the phantom seed are
+-- cleaned up automatically by services.database.purge_pristine_seed_hotel()
+-- on startup, but only when the seed row is still pristine and has no
+-- child data (rooms, bookings, users, services, etc.). Operators who
+-- repurposed the seed for their real hotel keep their data untouched.
 
 SELECT 'Migration complete ✓' AS result;
 SELECT 'IMPORTANT: Change admin password at /admin after first login!' AS warning;
