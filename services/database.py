@@ -345,7 +345,157 @@ async def ensure_schema_v2():
         await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_booking ON hotel_food_orders(booking_id)")
         await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_room    ON hotel_food_orders(room_number, status)")
 
-        logger.info("✅ schema_v2 ensured (audit_log, housekeeping_log, maintenance_tickets, gstin, webhook_secret, hotel_food_items, hotel_food_orders)")
+        # 4. Channel Manager — OTA aggregator integration
+        # We integrate with one channel-manager aggregator per hotel (AxisRooms,
+        # STAAH, RateGain, etc.) which itself fans out to MMT / Booking.com /
+        # Goibibo / Agoda / Expedia. So one connection here = 50+ OTAs live.
+        #
+        # Tables:
+        #   channel_accounts       — provider, credentials, hotel_code per hotel
+        #   channel_room_types     — map our rooms to provider room_type_codes
+        #   channel_rate_plans     — map our rate plans to provider rate_plan_codes
+        #   channel_inventory      — daily inventory snapshot we last pushed
+        #   channel_sync_log       — append-only log of every sync attempt
+        #   channel_bookings       — OTA reservations pulled from the aggregator
+        await execute("""
+            CREATE TABLE IF NOT EXISTS channel_accounts (
+                id              SERIAL PRIMARY KEY,
+                hotel_id        INTEGER      NOT NULL UNIQUE,
+                provider        VARCHAR(40)  NOT NULL DEFAULT 'axisrooms', -- axisrooms / staah / rategain / siteminder
+                base_url        VARCHAR(300) DEFAULT '',
+                hotel_code      VARCHAR(80)  DEFAULT '',
+                api_key         VARCHAR(300) DEFAULT '',
+                api_secret      VARCHAR(300) DEFAULT '',
+                username        VARCHAR(120) DEFAULT '',
+                password        VARCHAR(300) DEFAULT '',
+                webhook_secret  VARCHAR(200) DEFAULT '',
+                push_inventory_minutes INTEGER DEFAULT 30,
+                pull_bookings_minutes  INTEGER DEFAULT 15,
+                inventory_horizon_days INTEGER DEFAULT 60,
+                dry_run         BOOLEAN      DEFAULT TRUE,  -- safety: don't hit live API until operator flips off
+                is_active       BOOLEAN      DEFAULT FALSE,
+                last_inventory_push_at TIMESTAMP,
+                last_booking_pull_at   TIMESTAMP,
+                last_error      TEXT         DEFAULT '',
+                created_at      TIMESTAMP    DEFAULT NOW(),
+                updated_at      TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_accounts_hotel ON channel_accounts(hotel_id)")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS channel_room_types (
+                id                  SERIAL PRIMARY KEY,
+                hotel_id            INTEGER      NOT NULL,
+                room_type           VARCHAR(80)  NOT NULL,        -- our internal room_type label (matches rooms.room_type)
+                provider_code       VARCHAR(80)  NOT NULL,        -- e.g. "DLX", "STD" — what the aggregator calls it
+                provider_label      VARCHAR(150) DEFAULT '',      -- human label for ops UI
+                total_units         INTEGER      DEFAULT 0,       -- how many of this type we sell on OTAs
+                base_rate           NUMERIC(10,2) DEFAULT 0,
+                is_active           BOOLEAN      DEFAULT TRUE,
+                created_at          TIMESTAMP    DEFAULT NOW(),
+                updated_at          TIMESTAMP    DEFAULT NOW(),
+                UNIQUE(hotel_id, provider_code)
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_room_types_hotel ON channel_room_types(hotel_id)")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS channel_rate_plans (
+                id              SERIAL PRIMARY KEY,
+                hotel_id        INTEGER      NOT NULL,
+                room_type_id    INTEGER      NOT NULL,            -- FK channel_room_types.id (loose)
+                code            VARCHAR(40)  NOT NULL,            -- BAR / NRR / EP / CP / MAP / AP
+                name            VARCHAR(150) DEFAULT '',
+                meal_plan       VARCHAR(20)  DEFAULT 'EP',        -- EP / CP / MAP / AP
+                rate_modifier   NUMERIC(6,3) DEFAULT 1.000,        -- multiplier on base_rate (e.g. 0.9 for NRR)
+                is_default      BOOLEAN      DEFAULT FALSE,
+                is_active       BOOLEAN      DEFAULT TRUE,
+                created_at      TIMESTAMP    DEFAULT NOW(),
+                updated_at      TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_rate_plans_hotel ON channel_rate_plans(hotel_id)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_rate_plans_rt    ON channel_rate_plans(room_type_id)")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS channel_inventory (
+                id              SERIAL PRIMARY KEY,
+                hotel_id        INTEGER      NOT NULL,
+                room_type_id    INTEGER      NOT NULL,
+                stay_date       DATE         NOT NULL,
+                available_units INTEGER      DEFAULT 0,
+                base_rate       NUMERIC(10,2) DEFAULT 0,
+                stop_sell       BOOLEAN      DEFAULT FALSE,
+                last_pushed_at  TIMESTAMP,
+                last_push_status VARCHAR(20) DEFAULT 'pending',   -- pending / ok / failed
+                created_at      TIMESTAMP    DEFAULT NOW(),
+                updated_at      TIMESTAMP    DEFAULT NOW(),
+                UNIQUE(hotel_id, room_type_id, stay_date)
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_inv_hotel_date ON channel_inventory(hotel_id, stay_date)")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS channel_sync_log (
+                id              SERIAL PRIMARY KEY,
+                hotel_id        INTEGER      NOT NULL,
+                provider        VARCHAR(40)  DEFAULT '',
+                operation       VARCHAR(40)  NOT NULL,            -- push_inventory / push_rates / pull_bookings / connect
+                status          VARCHAR(20)  DEFAULT 'ok',        -- ok / failed / dry_run
+                records         INTEGER      DEFAULT 0,
+                duration_ms     INTEGER      DEFAULT 0,
+                error           TEXT         DEFAULT '',
+                payload_summary TEXT         DEFAULT '',           -- short summary, never raw secrets
+                created_at      TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_sync_log_hotel ON channel_sync_log(hotel_id, created_at DESC)")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS channel_bookings (
+                id                  SERIAL PRIMARY KEY,
+                hotel_id            INTEGER      NOT NULL,
+                provider            VARCHAR(40)  DEFAULT '',
+                provider_ref        VARCHAR(120) NOT NULL,        -- the aggregator's reservation id
+                ota_source          VARCHAR(60)  DEFAULT '',      -- mmt / goibibo / booking_com / agoda / expedia / direct
+                ota_booking_id      VARCHAR(120) DEFAULT '',      -- the OTA's own reservation number, if available
+                guest_name          VARCHAR(200) DEFAULT '',
+                guest_email         VARCHAR(200) DEFAULT '',
+                guest_phone         VARCHAR(40)  DEFAULT '',
+                guest_country       VARCHAR(80)  DEFAULT '',
+                checkin_date        DATE,
+                checkout_date       DATE,
+                nights              INTEGER      DEFAULT 0,
+                guests              INTEGER      DEFAULT 1,
+                room_type_code      VARCHAR(80)  DEFAULT '',
+                rate_plan_code      VARCHAR(40)  DEFAULT '',
+                room_count          INTEGER      DEFAULT 1,
+                currency            VARCHAR(8)   DEFAULT 'INR',
+                total_amount        NUMERIC(12,2) DEFAULT 0,
+                ota_commission      NUMERIC(12,2) DEFAULT 0,
+                payment_terms       VARCHAR(40)  DEFAULT 'pay_at_hotel', -- pay_at_hotel / prepaid
+                status              VARCHAR(20)  DEFAULT 'new',          -- new / confirmed / modified / cancelled / ingested
+                special_requests    TEXT         DEFAULT '',
+                raw_payload         TEXT         DEFAULT '',
+                mapped_booking_id   VARCHAR(40)  DEFAULT '',             -- bookings.booking_id once ingested
+                received_at         TIMESTAMP    DEFAULT NOW(),
+                ingested_at         TIMESTAMP,
+                cancelled_at        TIMESTAMP,
+                created_at          TIMESTAMP    DEFAULT NOW(),
+                updated_at          TIMESTAMP    DEFAULT NOW(),
+                UNIQUE(hotel_id, provider, provider_ref)
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_bookings_hotel  ON channel_bookings(hotel_id, status)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_bookings_dates  ON channel_bookings(hotel_id, checkin_date)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_channel_bookings_phone  ON channel_bookings(guest_phone)")
+        # Tag native bookings that originated from a channel-manager pull, so
+        # the dashboard can show a small "OTA · MMT" badge next to them.
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ota_source     VARCHAR(60) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS channel_ref    VARCHAR(120) DEFAULT ''")
+
+        logger.info("✅ schema_v2 ensured (audit_log, housekeeping, maintenance, food, formc, channel_manager)")
     except Exception as e:
         logger.exception("ensure_schema_v2 failed: %s", e)
 
@@ -1402,4 +1552,407 @@ async def get_active_food_orders_for_room(hid: int, room: str) -> List[Dict]:
              AND status IN ('Placed','Preparing','Ready')
            ORDER BY id DESC""",
         hid, room,
+    )
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# CHANNEL MANAGER (OTA aggregator: AxisRooms / STAAH / RateGain)
+# One adapter integration here = MMT + Goibibo + Booking.com + Agoda
+# + Expedia + 50 more, because the aggregator already speaks to all of
+# them. We only have to be a clean source of inventory and a faithful
+# sink for OTA reservations. Everything below is per-hotel.
+# ══════════════════════════════════════════════════════════════════
+async def get_channel_account(hotel_id: int) -> Optional[Dict]:
+    return await fetchrow(
+        "SELECT * FROM channel_accounts WHERE hotel_id=$1", hotel_id
+    )
+
+
+# Fields the operator can set/update via the dashboard. We deliberately
+# keep this list small — secret material is only writable through the
+# explicit "connect" path, not via a generic update.
+_CHANNEL_ACCOUNT_BASIC = [
+    "provider", "base_url", "hotel_code",
+    "push_inventory_minutes", "pull_bookings_minutes",
+    "inventory_horizon_days", "dry_run", "is_active",
+]
+_CHANNEL_ACCOUNT_SECRETS = [
+    "api_key", "api_secret", "username", "password", "webhook_secret",
+]
+
+
+async def upsert_channel_account(hotel_id: int, data: Dict) -> Dict:
+    """
+    Insert or update the channel-manager account row for this hotel.
+    Secrets are only overwritten when explicitly provided in `data` — so a
+    dashboard "save" that only changes intervals never wipes the API key.
+    """
+    existing = await get_channel_account(hotel_id)
+    if not existing:
+        row = await fetchrow("""
+            INSERT INTO channel_accounts
+                (hotel_id, provider, base_url, hotel_code,
+                 api_key, api_secret, username, password, webhook_secret,
+                 push_inventory_minutes, pull_bookings_minutes,
+                 inventory_horizon_days, dry_run, is_active)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            RETURNING *""",
+            hotel_id,
+            (data.get("provider") or "axisrooms")[:40],
+            (data.get("base_url") or "")[:300],
+            (data.get("hotel_code") or "")[:80],
+            (data.get("api_key") or "")[:300],
+            (data.get("api_secret") or "")[:300],
+            (data.get("username") or "")[:120],
+            (data.get("password") or "")[:300],
+            (data.get("webhook_secret") or "")[:200],
+            int(data.get("push_inventory_minutes") or 30),
+            int(data.get("pull_bookings_minutes") or 15),
+            int(data.get("inventory_horizon_days") or 60),
+            bool(data.get("dry_run", True)),
+            bool(data.get("is_active", False)),
+        )
+        return dict(row)
+
+    fields, vals, i = [], [], 1
+    for k in _CHANNEL_ACCOUNT_BASIC:
+        if k in data:
+            fields.append(f"{k}=${i}")
+            vals.append(data[k])
+            i += 1
+    for k in _CHANNEL_ACCOUNT_SECRETS:
+        # Only overwrite if a non-empty value is provided.
+        if k in data and (data[k] or "") != "":
+            fields.append(f"{k}=${i}")
+            vals.append(str(data[k])[:300])
+            i += 1
+    if not fields:
+        return existing
+    fields.append("updated_at=NOW()")
+    vals.append(hotel_id)
+    return await fetchrow(
+        f"UPDATE channel_accounts SET {','.join(fields)} "
+        f"WHERE hotel_id=${i} RETURNING *",
+        *vals,
+    )
+
+
+async def disconnect_channel_account(hotel_id: int):
+    """Mark account inactive and wipe credentials. Keeps row for audit."""
+    await execute(
+        """UPDATE channel_accounts
+           SET is_active=FALSE, api_key='', api_secret='', password='',
+               webhook_secret='', last_error='', updated_at=NOW()
+           WHERE hotel_id=$1""",
+        hotel_id,
+    )
+
+
+async def update_channel_account_status(hotel_id: int, *,
+                                        last_inventory_push_at=None,
+                                        last_booking_pull_at=None,
+                                        last_error: Optional[str] = None):
+    """Updated by the sync workers; never by a user-facing API."""
+    fields, vals, i = [], [], 1
+    if last_inventory_push_at is not None:
+        fields.append(f"last_inventory_push_at=${i}"); vals.append(last_inventory_push_at); i += 1
+    if last_booking_pull_at is not None:
+        fields.append(f"last_booking_pull_at=${i}"); vals.append(last_booking_pull_at); i += 1
+    if last_error is not None:
+        fields.append(f"last_error=${i}"); vals.append(str(last_error)[:2000]); i += 1
+    if not fields:
+        return
+    fields.append("updated_at=NOW()")
+    vals.append(hotel_id)
+    await execute(
+        f"UPDATE channel_accounts SET {','.join(fields)} WHERE hotel_id=${i}",
+        *vals,
+    )
+
+
+# ── Room-type and rate-plan mapping ─────────────────────────────────
+async def list_channel_room_types(hotel_id: int) -> List[Dict]:
+    return await fetch(
+        "SELECT * FROM channel_room_types WHERE hotel_id=$1 ORDER BY provider_code",
+        hotel_id,
+    )
+
+
+async def upsert_channel_room_type(hotel_id: int, data: Dict) -> Dict:
+    row = await fetchrow("""
+        INSERT INTO channel_room_types
+            (hotel_id, room_type, provider_code, provider_label,
+             total_units, base_rate, is_active)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT (hotel_id, provider_code) DO UPDATE
+           SET room_type=$2, provider_label=$4, total_units=$5,
+               base_rate=$6, is_active=$7, updated_at=NOW()
+        RETURNING *""",
+        hotel_id,
+        (data.get("room_type") or "")[:80],
+        (data.get("provider_code") or "")[:80],
+        (data.get("provider_label") or "")[:150],
+        int(data.get("total_units") or 0),
+        float(data.get("base_rate") or 0),
+        bool(data.get("is_active", True)),
+    )
+    return dict(row)
+
+
+async def delete_channel_room_type(hotel_id: int, rt_id: int):
+    await execute(
+        "DELETE FROM channel_room_types WHERE id=$1 AND hotel_id=$2",
+        rt_id, hotel_id,
+    )
+
+
+async def list_channel_rate_plans(hotel_id: int) -> List[Dict]:
+    return await fetch(
+        "SELECT * FROM channel_rate_plans WHERE hotel_id=$1 ORDER BY room_type_id, code",
+        hotel_id,
+    )
+
+
+async def upsert_channel_rate_plan(hotel_id: int, data: Dict) -> Dict:
+    rp_id = data.get("id")
+    if rp_id:
+        row = await fetchrow("""
+            UPDATE channel_rate_plans
+            SET room_type_id=$2, code=$3, name=$4, meal_plan=$5,
+                rate_modifier=$6, is_default=$7, is_active=$8,
+                updated_at=NOW()
+            WHERE id=$1 AND hotel_id=$9 RETURNING *""",
+            int(rp_id),
+            int(data.get("room_type_id") or 0),
+            (data.get("code") or "BAR")[:40],
+            (data.get("name") or "")[:150],
+            (data.get("meal_plan") or "EP")[:20],
+            float(data.get("rate_modifier") or 1.0),
+            bool(data.get("is_default", False)),
+            bool(data.get("is_active", True)),
+            hotel_id,
+        )
+    else:
+        row = await fetchrow("""
+            INSERT INTO channel_rate_plans
+                (hotel_id, room_type_id, code, name, meal_plan,
+                 rate_modifier, is_default, is_active)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *""",
+            hotel_id,
+            int(data.get("room_type_id") or 0),
+            (data.get("code") or "BAR")[:40],
+            (data.get("name") or "")[:150],
+            (data.get("meal_plan") or "EP")[:20],
+            float(data.get("rate_modifier") or 1.0),
+            bool(data.get("is_default", False)),
+            bool(data.get("is_active", True)),
+        )
+    return dict(row) if row else {}
+
+
+async def delete_channel_rate_plan(hotel_id: int, rp_id: int):
+    await execute(
+        "DELETE FROM channel_rate_plans WHERE id=$1 AND hotel_id=$2",
+        rp_id, hotel_id,
+    )
+
+
+# ── Inventory snapshots (what we last pushed for date X) ────────────
+async def upsert_channel_inventory(hotel_id: int, room_type_id: int,
+                                   stay_date, available_units: int,
+                                   base_rate: float, stop_sell: bool,
+                                   status: str = "pending"):
+    await execute("""
+        INSERT INTO channel_inventory
+            (hotel_id, room_type_id, stay_date, available_units, base_rate,
+             stop_sell, last_pushed_at, last_push_status)
+        VALUES ($1,$2,$3,$4,$5,$6, NOW(), $7)
+        ON CONFLICT (hotel_id, room_type_id, stay_date) DO UPDATE
+           SET available_units=$4, base_rate=$5, stop_sell=$6,
+               last_pushed_at=NOW(), last_push_status=$7, updated_at=NOW()""",
+        hotel_id, room_type_id, stay_date,
+        int(available_units), float(base_rate),
+        bool(stop_sell), status[:20],
+    )
+
+
+async def list_channel_inventory(hotel_id: int, days: int = 30) -> List[Dict]:
+    return await fetch(
+        """SELECT ci.*, rt.provider_code, rt.room_type, rt.provider_label
+           FROM channel_inventory ci
+           LEFT JOIN channel_room_types rt ON rt.id=ci.room_type_id
+           WHERE ci.hotel_id=$1 AND ci.stay_date >= CURRENT_DATE
+             AND ci.stay_date <  CURRENT_DATE + ($2::int || ' days')::interval
+           ORDER BY ci.stay_date, rt.provider_code""",
+        hotel_id, max(1, min(int(days), 365)),
+    )
+
+
+# ── Sync log ────────────────────────────────────────────────────────
+async def insert_sync_log(hotel_id: int, provider: str, operation: str, *,
+                          status: str = "ok", records: int = 0,
+                          duration_ms: int = 0, error: str = "",
+                          payload_summary: str = ""):
+    await execute("""
+        INSERT INTO channel_sync_log
+            (hotel_id, provider, operation, status, records,
+             duration_ms, error, payload_summary)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+        hotel_id, (provider or "")[:40], (operation or "")[:40],
+        (status or "ok")[:20], int(records or 0), int(duration_ms or 0),
+        (error or "")[:4000], (payload_summary or "")[:4000],
+    )
+
+
+async def list_sync_log(hotel_id: int, limit: int = 100) -> List[Dict]:
+    return await fetch(
+        "SELECT * FROM channel_sync_log WHERE hotel_id=$1 "
+        "ORDER BY id DESC LIMIT $2",
+        hotel_id, max(1, min(int(limit), 500)),
+    )
+
+
+# ── Channel reservations (OTA bookings pulled from aggregator) ──────
+async def upsert_channel_booking(hotel_id: int, provider: str,
+                                 provider_ref: str, data: Dict) -> Dict:
+    """
+    Idempotent upsert keyed on (hotel_id, provider, provider_ref). Used by
+    pull_bookings to absorb the same reservation multiple times safely
+    (e.g. after the OTA sends a modification).
+    """
+    row = await fetchrow("""
+        INSERT INTO channel_bookings
+            (hotel_id, provider, provider_ref, ota_source, ota_booking_id,
+             guest_name, guest_email, guest_phone, guest_country,
+             checkin_date, checkout_date, nights, guests,
+             room_type_code, rate_plan_code, room_count,
+             currency, total_amount, ota_commission, payment_terms,
+             status, special_requests, raw_payload)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,
+                $14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+        ON CONFLICT (hotel_id, provider, provider_ref) DO UPDATE
+           SET ota_source=EXCLUDED.ota_source,
+               ota_booking_id=EXCLUDED.ota_booking_id,
+               guest_name=EXCLUDED.guest_name,
+               guest_email=EXCLUDED.guest_email,
+               guest_phone=EXCLUDED.guest_phone,
+               guest_country=EXCLUDED.guest_country,
+               checkin_date=EXCLUDED.checkin_date,
+               checkout_date=EXCLUDED.checkout_date,
+               nights=EXCLUDED.nights,
+               guests=EXCLUDED.guests,
+               room_type_code=EXCLUDED.room_type_code,
+               rate_plan_code=EXCLUDED.rate_plan_code,
+               room_count=EXCLUDED.room_count,
+               currency=EXCLUDED.currency,
+               total_amount=EXCLUDED.total_amount,
+               ota_commission=EXCLUDED.ota_commission,
+               payment_terms=EXCLUDED.payment_terms,
+               status=CASE
+                   WHEN channel_bookings.status='ingested' AND EXCLUDED.status<>'cancelled'
+                   THEN channel_bookings.status
+                   ELSE EXCLUDED.status END,
+               special_requests=EXCLUDED.special_requests,
+               raw_payload=EXCLUDED.raw_payload,
+               updated_at=NOW(),
+               cancelled_at=CASE WHEN EXCLUDED.status='cancelled' THEN NOW() ELSE channel_bookings.cancelled_at END
+        RETURNING *""",
+        hotel_id, (provider or "")[:40], provider_ref[:120],
+        (data.get("ota_source") or "")[:60],
+        (data.get("ota_booking_id") or "")[:120],
+        (data.get("guest_name") or "")[:200],
+        (data.get("guest_email") or "")[:200],
+        (data.get("guest_phone") or "")[:40],
+        (data.get("guest_country") or "")[:80],
+        data.get("checkin_date"), data.get("checkout_date"),
+        int(data.get("nights") or 0), int(data.get("guests") or 1),
+        (data.get("room_type_code") or "")[:80],
+        (data.get("rate_plan_code") or "")[:40],
+        int(data.get("room_count") or 1),
+        (data.get("currency") or "INR")[:8],
+        float(data.get("total_amount") or 0),
+        float(data.get("ota_commission") or 0),
+        (data.get("payment_terms") or "pay_at_hotel")[:40],
+        (data.get("status") or "new")[:20],
+        (data.get("special_requests") or "")[:2000],
+        (data.get("raw_payload") or "")[:8000],
+    )
+    return dict(row)
+
+
+async def list_channel_bookings(hotel_id: int, status: Optional[str] = None,
+                                limit: int = 200) -> List[Dict]:
+    if status:
+        return await fetch(
+            """SELECT * FROM channel_bookings
+               WHERE hotel_id=$1 AND status=$2
+               ORDER BY checkin_date DESC, id DESC LIMIT $3""",
+            hotel_id, status, max(1, min(int(limit), 1000)),
+        )
+    return await fetch(
+        """SELECT * FROM channel_bookings WHERE hotel_id=$1
+           ORDER BY checkin_date DESC, id DESC LIMIT $2""",
+        hotel_id, max(1, min(int(limit), 1000)),
+    )
+
+
+async def get_channel_booking(hotel_id: int, provider: str,
+                              provider_ref: str) -> Optional[Dict]:
+    return await fetchrow(
+        "SELECT * FROM channel_bookings "
+        "WHERE hotel_id=$1 AND provider=$2 AND provider_ref=$3",
+        hotel_id, provider, provider_ref,
+    )
+
+
+async def mark_channel_booking_ingested(channel_booking_id: int,
+                                        hotel_id: int,
+                                        booking_id: str):
+    await execute(
+        """UPDATE channel_bookings
+           SET status='ingested', mapped_booking_id=$3,
+               ingested_at=NOW(), updated_at=NOW()
+           WHERE id=$1 AND hotel_id=$2""",
+        channel_booking_id, hotel_id, booking_id[:40],
+    )
+
+
+async def aggregate_inventory_for_dates(hotel_id: int, dates: List) -> List[Dict]:
+    """
+    For each (room_type, date) compute available_units = total_units - reserved.
+    `reserved` = active bookings whose stay overlaps the date AND whose room
+    has the matching room_type. Used by the inventory pusher.
+    """
+    if not dates:
+        return []
+    return await fetch(
+        """
+        WITH dates AS (
+            SELECT unnest($2::date[]) AS d
+        ),
+        types AS (
+            SELECT id, hotel_id, room_type, provider_code, total_units, base_rate
+            FROM channel_room_types
+            WHERE hotel_id=$1 AND is_active=TRUE
+        ),
+        reserved AS (
+            SELECT r.room_type, d.d AS stay_date, COUNT(*) AS held
+            FROM dates d
+            JOIN bookings b ON b.hotel_id=$1
+                            AND b.status IN ('Active','Reserved','CheckedIn','CheckedOut')
+                            AND b.checkin_date  <= d.d
+                            AND b.checkout_date >  d.d
+            JOIN rooms r ON r.room_number=b.room_number AND r.hotel_id=$1
+            GROUP BY r.room_type, d.d
+        )
+        SELECT t.id AS room_type_id, t.room_type, t.provider_code,
+               t.total_units, t.base_rate, d.d AS stay_date,
+               GREATEST(t.total_units - COALESCE(r.held,0), 0) AS available_units
+        FROM types t CROSS JOIN dates d
+        LEFT JOIN reserved r
+               ON r.room_type=t.room_type AND r.stay_date=d.d
+        ORDER BY d.d, t.provider_code
+        """,
+        hotel_id, dates,
     )
