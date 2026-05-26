@@ -2,7 +2,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from scheduler.jobs import (job_daily_report, job_monthly_report,
     job_reminder_1, job_reminder_2, job_late_alert,
-    job_auto_late_charge, job_auto_cleanup)
+    job_auto_late_charge, job_auto_cleanup, job_night_audit)
 from services.database import get_all_hotels
 import logging
 
@@ -46,6 +46,12 @@ async def start_scheduler():
             CronTrigger(hour=h.get("sched_auto_charge_hour",12),
                         minute=h.get("sched_auto_charge_min",0), timezone="Asia/Kolkata"),
             id=f"charge_{hid}", replace_existing=True)
+
+        # Nightly close — runs once per day per hotel. Default 02:00 IST.
+        scheduler.add_job(job_night_audit,
+            CronTrigger(hour=h.get("sched_night_audit_hour",2),
+                        minute=h.get("sched_night_audit_min",0), timezone="Asia/Kolkata"),
+            id=f"night_audit_{hid}", replace_existing=True)
 
         logger.info(f"Scheduled jobs for: {h['hotel_name']}")
 

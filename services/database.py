@@ -345,7 +345,67 @@ async def ensure_schema_v2():
         await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_booking ON hotel_food_orders(booking_id)")
         await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_room    ON hotel_food_orders(room_number, status)")
 
-        logger.info("✅ schema_v2 ensured (audit_log, housekeeping_log, maintenance_tickets, gstin, webhook_secret, hotel_food_items, hotel_food_orders)")
+        # 4. Night audit + KPI reports.
+        # Bigger hotels (3-star and above) cannot evaluate the property
+        # without ADR / RevPAR / occupancy. The night audit also closes
+        # the books for each business day by auto-posting room rent for
+        # in-house guests, and reconciles cash + online collected.
+        # One row per (hotel_id, audit_date).
+        await execute("""
+            CREATE TABLE IF NOT EXISTS night_audits (
+                id                    SERIAL PRIMARY KEY,
+                hotel_id              INTEGER NOT NULL,
+                audit_date            DATE    NOT NULL,
+                status                VARCHAR(20) DEFAULT 'completed', -- completed/failed/dry_run
+                -- inventory
+                total_rooms           INTEGER DEFAULT 0,
+                occupied_rooms        INTEGER DEFAULT 0,    -- rooms in use that night
+                available_rooms       INTEGER DEFAULT 0,    -- total - occupied
+                room_nights_sold      INTEGER DEFAULT 0,    -- bookings overlapping audit_date
+                -- revenue
+                room_revenue          NUMERIC(12,2) DEFAULT 0,
+                food_revenue          NUMERIC(12,2) DEFAULT 0,
+                service_revenue       NUMERIC(12,2) DEFAULT 0,
+                other_revenue         NUMERIC(12,2) DEFAULT 0,
+                total_revenue         NUMERIC(12,2) DEFAULT 0,
+                tax_collected         NUMERIC(12,2) DEFAULT 0,
+                cash_collected        NUMERIC(12,2) DEFAULT 0,
+                online_collected      NUMERIC(12,2) DEFAULT 0,
+                pending_revenue       NUMERIC(12,2) DEFAULT 0,
+                -- KPI
+                adr                   NUMERIC(10,2) DEFAULT 0,
+                revpar                NUMERIC(10,2) DEFAULT 0,
+                trevpar               NUMERIC(10,2) DEFAULT 0,
+                occupancy_pct         NUMERIC(6,2)  DEFAULT 0,
+                -- movement
+                checkins_count        INTEGER DEFAULT 0,
+                checkouts_count       INTEGER DEFAULT 0,
+                no_shows_count        INTEGER DEFAULT 0,
+                -- bookkeeping
+                rent_postings_added   INTEGER DEFAULT 0,
+                rent_postings_skipped INTEGER DEFAULT 0,
+                errors                TEXT    DEFAULT '',
+                notes                 TEXT    DEFAULT '',
+                run_at                TIMESTAMP DEFAULT NOW(),
+                run_by                VARCHAR(100) DEFAULT 'scheduler',
+                UNIQUE(hotel_id, audit_date)
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_night_audits_hotel_date ON night_audits(hotel_id, audit_date DESC)")
+
+        # Per-hotel schedule knob — when to run the nightly audit (IST).
+        # Default 02:00 — late enough that guests have stopped paying for
+        # the day, early enough to be done before staff arrive.
+        await execute("ALTER TABLE hotels ADD COLUMN IF NOT EXISTS sched_night_audit_hour INTEGER DEFAULT 2")
+        await execute("ALTER TABLE hotels ADD COLUMN IF NOT EXISTS sched_night_audit_min  INTEGER DEFAULT 0")
+        # Default room rate per type used as the auto-post rent fallback
+        # when a room's stored rate is 0 (legacy seed data). Optional.
+        await execute("ALTER TABLE hotels ADD COLUMN IF NOT EXISTS auto_post_room_rent BOOLEAN DEFAULT TRUE")
+        # Idempotent extra column so source-mix reports work even if PR #9
+        # (channel manager) hasn't merged yet. Adds nothing if already there.
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ota_source VARCHAR(60) DEFAULT ''")
+
+        logger.info("✅ schema_v2 ensured (audit_log, housekeeping_log, maintenance_tickets, gstin, webhook_secret, hotel_food_items, hotel_food_orders, night_audits)")
     except Exception as e:
         logger.exception("ensure_schema_v2 failed: %s", e)
 
@@ -429,7 +489,9 @@ async def update_hotel(hid: int, data: Dict) -> Optional[Dict]:
         "max_late_fee","svc_open_hour","svc_close_hour","sched_daily_report_hour",
         "sched_monthly_report_hour","sched_reminder1_hour","sched_reminder2_hour",
         "sched_reminder2_min","sched_late_alert_hour","sched_late_alert_min",
-        "sched_auto_charge_hour","sched_auto_charge_min","is_active"
+        "sched_auto_charge_hour","sched_auto_charge_min",
+        "sched_night_audit_hour","sched_night_audit_min","auto_post_room_rent",
+        "is_active"
     ]
     fields, vals, i = [], [], 1
     for k, v in data.items():

@@ -199,3 +199,19 @@ async def job_auto_cleanup():
                     except: pass
     except Exception as e:
         logger.error(f"Auto cleanup error: {e}")
+
+
+
+
+# ─── Night audit (per-hotel daily close + KPI snapshot) ──────────
+async def job_night_audit():
+    """Per-hotel nightly close — auto-post room rent, persist KPIs,
+    WhatsApp the snapshot to owners. Idempotent. Runs once per hotel
+    per day at the hotel's configured `sched_night_audit_hour`."""
+    try:
+        from services.night_audit import run_for_all_hotels
+        results = await run_for_all_hotels()
+        if results:
+            logger.info("night_audit ran: %s", results)
+    except Exception as e:
+        logger.error(f"night_audit error: {e}")
