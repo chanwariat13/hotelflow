@@ -101,10 +101,13 @@ async def reg_page(slug: str, request: Request):
   <input type="date" id="coDate" min="{ist_now().strftime('%Y-%m-%d')}">
 </div>
 <div class="card"><div class="ct">👤 Primary Guest</div>
-  <label>Full Name *</label><input type="text" id="gName" placeholder="As per ID proof">
   <label>WhatsApp Number *</label><input type="tel" id="gPhone" placeholder="91XXXXXXXXXX">
+  <div id="welcomeBack" style="display:none;background:rgba(200,168,75,.15);border:1px solid var(--p);color:var(--p);border-radius:7px;padding:8px 12px;font-size:12px;margin:4px 0 6px"></div>
+  <label>Full Name *</label><input type="text" id="gName" placeholder="As per ID proof">
   <label>Alternate Phone</label><input type="tel" id="gAlt" placeholder="Optional">
   <label>Total Number of Guests *</label><input type="number" id="gCount" value="1" min="1" max="10" onchange="updateExtra()">
+  <label>Customer GSTIN (optional, for B2B tax invoice)</label>
+  <input type="text" id="gGstin" placeholder="22AAAAA0000A1Z5" maxlength="15" style="text-transform:uppercase">
 </div>
 <div class="card"><div class="ct">🪪 ID Proof</div>
   <label>ID Type *</label>
@@ -198,6 +201,7 @@ async function submit(){{
         name,phone,alternate_phone:document.getElementById('gAlt').value.trim(),
         guest_count:count,id_proof_type:idType,id_proof_number:idNum,
         id_proof_photo:idPhoto,id_proof_photo_back:document.getElementById('idBUrl').value,
+        customer_gstin:(document.getElementById('gGstin')?document.getElementById('gGstin').value.trim().toUpperCase():''),
         additional_guests:ag}})}});
     const d=await r.json();
     if(d.success){{
@@ -219,6 +223,34 @@ async function submit(){{
 const urlP=new URLSearchParams(window.location.search);
 const urlRoom=urlP.get('room');
 if(urlRoom){{const opts=[...document.getElementById('roomSel').options];const m=opts.find(o=>o.value===urlRoom);if(m){{document.getElementById('roomSel').value=urlRoom;onRoom();}}}}
+
+// ── Returning-guest auto-fill ─────────────────────────────────────
+let _luTimer=null,_luLast='';
+document.getElementById('gPhone').addEventListener('input', function(){{
+  const p=this.value.trim().replace(/\\D/g,'');
+  if(p.length<10||p===_luLast)return;
+  clearTimeout(_luTimer);
+  _luTimer=setTimeout(async()=>{{
+    _luLast=p;
+    try{{
+      const r=await fetch('/api/guest/lookup?slug={slug}&phone='+encodeURIComponent(p));
+      const d=await r.json();
+      const wb=document.getElementById('welcomeBack');
+      const ni=document.getElementById('gName');
+      const it=document.getElementById('idType');
+      if(d&&d.found){{
+        if(!ni.value||ni.value.trim().length<2)ni.value=d.name||'';
+        if(it&&!it.value&&d.id_proof_type){{
+          for(const o of it.options){{ if(o.value===d.id_proof_type){{ it.value=d.id_proof_type; break; }} }}
+        }}
+        wb.textContent='👋 Welcome back, '+(d.name||'guest')+'! ('+(d.total_visits||1)+' previous visit'+((d.total_visits||1)>1?'s':'')+')';
+        wb.style.display='block';
+      }}else{{
+        wb.style.display='none';
+      }}
+    }}catch(e){{ /* silent */ }}
+  }}, 350);
+}});
 </script>"""
     return HTMLResponse(themed(hotel,"Guest Registration",body))
 
@@ -398,6 +430,7 @@ async def api_register(request: Request):
     idn   = str(body.get("id_proof_number","")).strip().upper()
     idp   = str(body.get("id_proof_photo","")).strip()
     idb   = str(body.get("id_proof_photo_back","")).strip()
+    gstin = str(body.get("customer_gstin","")).strip().upper()
     if not all([room,phone,name,ci,co]):
         return JSONResponse({"success":False,"error":"Missing required fields"},400)
     room_row = await db.get_room(room, hid)
@@ -423,7 +456,7 @@ async def api_register(request: Request):
         "guest_phone":phone,"checkin_date":ci,"checkout_date":co,
         "payment_mode":"Pay at checkout","id_proof_type":idt,"id_proof_number":idn,
         "id_proof_photo":idp,"id_proof_photo_back":idb,"guest_count":count,
-        "alternate_phone":alt,"hotel_id":hid})
+        "alternate_phone":alt,"hotel_id":hid,"customer_gstin":gstin})
     if extra: await db.insert_additional_guests(bk_id, extra, hid)
     if rate > 0:
         await db.insert_stay_charge({"booking_id":bk_id,"charge_date":date.today(),
@@ -450,6 +483,24 @@ async def api_session(phone: str = ""):
     sess = await get_session(phone)
     if not sess: return JSONResponse({"found":False})
     return JSONResponse({"found":True,"name":sess.get("name"),"room":sess.get("room"),"booking_id":sess.get("bookingId"),"status":sess.get("status")})
+
+
+@router.get("/api/guest/lookup")
+async def api_lookup(slug: str = "", phone: str = ""):
+    """
+    Returning-guest auto-fill. If this phone has stayed at the hotel before,
+    return name + ID-type so the registration form can pre-fill them.
+    Always returns {found,...} — never errors out.
+    Sensitive fields (ID number, photos) are NOT returned — guest re-enters every visit.
+    """
+    try:
+        hotel = await db.get_hotel_by_slug(slug)
+        if not hotel:
+            return JSONResponse({"found": False})
+        info = await db.lookup_returning_guest(hotel["id"], (phone or "").strip())
+        return JSONResponse(info or {"found": False})
+    except Exception:
+        return JSONResponse({"found": False})
 
 @router.get("/api/guest/charges")
 async def api_charges(booking_id: str = ""):

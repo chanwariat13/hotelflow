@@ -82,6 +82,19 @@ def build_bill_html(booking: dict, charges: list, hotel: dict) -> str:
     bt = f"₹{balance:,.0f}" if balance>0 else "✓ FULLY PAID"
     logo_h = f'<img src="{logo}" style="height:55px;object-fit:contain;margin-bottom:7px"><br>' if logo else ""
 
+    # B2B / GST: if hotel has GSTIN configured, render this as a TAX INVOICE.
+    seller_gstin   = (hotel.get("gstin") or "").strip()
+    customer_gstin = (booking.get("customer_gstin") or "").strip()
+    invoice_kind = "TAX INVOICE" if seller_gstin else "GUEST FOLIO"
+    seller_gstin_html = (
+        f'<div style="font-size:11px;color:#666;margin-top:2px"><b>GSTIN:</b> {seller_gstin}</div>'
+        if seller_gstin else ""
+    )
+    customer_gstin_box = (
+        f'<div class="ib"><label>Customer GSTIN</label><p style="font-family:monospace;font-size:11px">{customer_gstin}</p></div>'
+        if customer_gstin else ""
+    )
+
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>*{{margin:0;padding:0;box-sizing:border-box;}}
 body{{font-family:Arial,sans-serif;font-size:13px;color:#333;background:#fff;padding:22px;}}
@@ -105,7 +118,8 @@ td{{padding:6px 7px;border-bottom:1px solid #eee;font-size:12px;}}
 <div class="hdr">
   {logo_h}<h1>{hn}</h1><div class="sub">{tag}</div>
   <div style="font-size:11px;color:#888;margin-top:3px">{addr}{", "+city if city else ""}{(" · "+ph) if ph else ""}</div>
-  <div style="font-size:11px;color:#888;margin-top:2px">GUEST FOLIO · {now}</div>
+  {seller_gstin_html}
+  <div style="font-size:11px;color:#888;margin-top:2px">{invoice_kind} · {now}</div>
 </div>
 <div class="ig">
   <div class="ib"><label>Guest</label><p>{name}</p></div>
@@ -114,6 +128,7 @@ td{{padding:6px 7px;border-bottom:1px solid #eee;font-size:12px;}}
   <div class="ib"><label>Check-out</label><p>{co}</p></div>
   <div class="ib"><label>Booking ID</label><p style="font-family:monospace;font-size:11px">{bid}</p></div>
   <div class="ib"><label>Payment</label><p>{booking.get("payment_mode","—")}</p></div>
+  {customer_gstin_box}
 </div>
 <table>
   <thead><tr><th>Category</th><th>Description</th><th style="text-align:center">Status</th><th style="text-align:right">Amount</th></tr></thead>

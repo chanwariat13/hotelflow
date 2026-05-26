@@ -75,6 +75,7 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02
   <div class="ni on" onclick="nav('dash')">📊 Master Dashboard</div>
   <div class="ni" onclick="nav('hotels')">🏨 All Hotels</div>
   <div class="ni" onclick="nav('bk')">📋 All Bookings</div>
+  <div class="ni" onclick="nav('audit')">📜 Audit Log</div>
   <div class="slbl">Hotel Management</div>
   <div class="ni" onclick="nav('add')">➕ Add New Hotel</div>
   <div class="slbl">Account</div>
@@ -120,6 +121,20 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02
   </table></div>
 </div>
 
+<!-- AUDIT LOG -->
+<div id="pg-audit" class="pg">
+  <h2 class="ptitle">📜 Audit Log</h2>
+  <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+    <select class="ti" id="auHotel" onchange="loadAudit()" style="width:200px"><option value="">All Hotels</option></select>
+    <input class="ti" id="auPrefix" placeholder="action prefix (e.g. razorpay.)" style="width:240px">
+    <button class="btn bg bsm" onclick="loadAudit()">↺ Refresh</button>
+  </div>
+  <div class="tw"><table>
+    <thead><tr><th>When</th><th>Hotel</th><th>Actor</th><th>Role</th><th>Action</th><th>Target</th><th>Payload</th><th>IP</th></tr></thead>
+    <tbody id="auTb"><tr><td colspan="8" style="text-align:center;color:var(--t2);padding:28px">Loading...</td></tr></tbody>
+  </table></div>
+</div>
+
 <!-- ADD NEW HOTEL -->
 <div id="pg-add" class="pg">
   <h2 class="ptitle">➕ Add New Hotel Client</h2>
@@ -162,8 +177,9 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02
       <button type="button" id="tUPI" class="btn bgh bsm" onclick="setPay('upi')">📱 UPI</button>
     </div>
     <input type="hidden" id="hPM" value="razorpay">
-    <div id="rzpFields" class="fgrid"><div class="fg"><label>Razorpay Key ID</label><input id="hRK" placeholder="rzp_live_..."></div><div class="fg"><label>Razorpay Secret</label><input id="hRS" type="password" placeholder="••••••••"></div></div>
+    <div id="rzpFields" class="fgrid"><div class="fg"><label>Razorpay Key ID</label><input id="hRK" placeholder="rzp_live_..."></div><div class="fg"><label>Razorpay Secret</label><input id="hRS" type="password" placeholder="••••••••"></div><div class="fg"><label>Razorpay Webhook Secret <span style="color:var(--gd)">★ required for safe payments</span></label><input id="hRWH" placeholder="From Razorpay Dashboard → Webhooks"><small style="color:var(--t2);font-size:11px">Webhook will return 503 until this is set.</small></div></div>
     <div id="upiFields" class="fgrid" style="display:none"><div class="fg"><label>UPI ID</label><input id="hUI" placeholder="hotel@okaxis"></div><div class="fg"><label>UPI Display Name</label><input id="hUD" placeholder="Grand Stay Hotel"></div></div>
+    <div class="fgrid" style="margin-top:10px"><div class="fg"><label>Hotel GSTIN (B2B tax invoice)</label><input id="hGSTIN" placeholder="22AAAAA0000A1Z5" maxlength="15" style="text-transform:uppercase"></div></div>
   </div>
 
   <div class="fsec"><div class="ft">Section 5 — Charges & Schedule</div><div class="fgrid">
@@ -250,7 +266,7 @@ function nav(p){
   cp=p;lp(p);
 }
 async function lp(p){
-  if(p==='dash')lDash();else if(p==='hotels')lHotels();else if(p==='bk')lBk();
+  if(p==='dash')lDash();else if(p==='hotels')lHotels();else if(p==='bk')lBk();else if(p==='audit')loadAudit();
 }
 function toast(m,t='ok'){const e=document.getElementById('toast');e.textContent=m;e.className='toast show t'+t;setTimeout(()=>e.className='toast',3000);}
 async function api(path,method='GET',body=null){
@@ -357,8 +373,110 @@ async function manageH(id,slug){
       <button class="btn bgh bsm" onclick="window.open('/hotel/${slug}','_blank')">Open Hotel Dashboard →</button>
       <button class="btn bgh bsm" onclick="window.open('/register/${slug}','_blank')">Preview Reg Page</button>
       <button class="btn bgh bsm" onclick="window.open('/menu/${slug}','_blank')">Preview Menu Page</button>
+      <button class="btn bgh bsm" onclick="openHK(${id})">🧹 Housekeeping</button>
+      <button class="btn bgh bsm" onclick="openMT(${id})">🔧 Maintenance</button>
     </div>`;
   oM();
+}
+
+// ── Housekeeping modal ──────────────────────────────────────────────
+async function openHK(hid){
+  document.getElementById('mT').textContent='🧹 Housekeeping';
+  document.getElementById('mC').innerHTML='<div style="color:var(--t2);font-size:13px;padding:14px">Loading...</div>';
+  oM();
+  const d=await api('/api/admin/hotels/'+hid+'/housekeeping');
+  if(!d){return;}
+  const STATUSES=[['clean','✅ Clean'],['dirty','🧺 Dirty'],['cleaning','🧽 Cleaning'],['inspected','🔍 Inspected'],['maintenance','🔧 Maintenance']];
+  const rows=(d.rooms||[]).map(r=>{
+    const sel=STATUSES.map(([v,l])=>'<option value="'+v+'"'+(r.housekeeping_status===v?' selected':'')+'>'+l+'</option>').join('');
+    const last=r.last_cleaned_at?(' · '+(r.last_cleaned_by||'-')+' @ '+r.last_cleaned_at.replace('T',' ').slice(0,16)):'';
+    return '<tr><td><b>'+r.room_number+'</b><br><span style="font-size:11px;color:var(--t2)">'+(r.room_type||'')+'</span></td>'+
+      '<td><span style="font-size:11px;color:var(--t2)">'+r.room_status+last+'</span></td>'+
+      '<td><select id="hk_'+r.room_number+'" class="ti">'+sel+'</select></td>'+
+      '<td><button class="btn bg bsm" onclick="setHK('+hid+',\''+r.room_number+'\')">Update</button></td></tr>';
+  }).join('');
+  const log=(d.log||[]).slice(0,15).map(e=>'<tr><td style="font-size:11px;color:var(--t2);font-family:monospace">'+(e.created_at||'').replace('T',' ').slice(0,16)+'</td><td>'+e.room_number+'</td><td>'+e.status+'</td><td>'+(e.cleaned_by||'')+'</td><td style="font-size:11px;color:var(--t2)">'+(e.notes||'')+'</td></tr>').join('');
+  document.getElementById('mC').innerHTML=
+    '<div class="ft">Rooms</div>'+
+    '<div class="tw"><table><thead><tr><th>Room</th><th>Live status</th><th>Set housekeeping</th><th></th></tr></thead><tbody>'+(rows||'<tr><td colspan=4 style="padding:14px;color:var(--t2)">No rooms</td></tr>')+'</tbody></table></div>'+
+    '<div class="ft" style="margin-top:14px">Recent activity</div>'+
+    '<div class="tw"><table><thead><tr><th>When</th><th>Room</th><th>Status</th><th>By</th><th>Notes</th></tr></thead><tbody>'+(log||'<tr><td colspan=5 style="padding:14px;color:var(--t2)">No history yet</td></tr>')+'</tbody></table></div>';
+}
+async function setHK(hid,room){
+  const status=document.getElementById('hk_'+room).value;
+  const r=await api('/api/admin/hotels/'+hid+'/housekeeping','POST',{room_number:room,status});
+  if(r&&r.success){toast('Updated '+room+' → '+status);openHK(hid);}
+}
+
+// ── Maintenance tickets modal ───────────────────────────────────────
+async function openMT(hid){
+  document.getElementById('mT').textContent='🔧 Maintenance Tickets';
+  oM();
+  document.getElementById('mC').innerHTML='<div style="color:var(--t2);font-size:13px;padding:14px">Loading...</div>';
+  const d=await api('/api/admin/hotels/'+hid+'/maintenance');
+  if(!d){return;}
+  const PRIO={urgent:'🔴 Urgent',high:'🟠 High',normal:'🟡 Normal',low:'⚪ Low'};
+  const STAT={open:'🆕 Open',in_progress:'🔧 In progress',resolved:'✅ Resolved',cancelled:'⛔ Cancelled'};
+  const rows=(d.tickets||[]).map(t=>{
+    return '<tr><td>#'+t.id+'</td><td><b>'+t.title+'</b><br><span style="font-size:11px;color:var(--t2)">R'+(t.room_number||'-')+' · '+(t.assigned_to||'unassigned')+'</span></td>'+
+      '<td>'+(PRIO[t.priority]||t.priority)+'</td>'+
+      '<td>'+(STAT[t.status]||t.status)+'</td>'+
+      '<td style="font-size:11px;color:var(--t2)">'+(t.reported_at||'').replace('T',' ').slice(0,16)+'</td>'+
+      '<td><select id="mts_'+t.id+'" class="ti" style="font-size:11px">'+
+        Object.entries(STAT).map(([v,l])=>'<option value="'+v+'"'+(t.status===v?' selected':'')+'>'+l+'</option>').join('')+
+        '</select> '+
+        '<button class="btn bg bsm" onclick="updMT('+hid+','+t.id+')">Save</button></td></tr>';
+  }).join('');
+  document.getElementById('mC').innerHTML=
+    '<div class="ft">+ New ticket</div>'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">'+
+      '<input class="ti" id="mtT" placeholder="Title (e.g. AC not cooling)">'+
+      '<input class="ti" id="mtR" placeholder="Room (e.g. 304)">'+
+      '<select class="ti" id="mtP"><option value="low">Low</option><option value="normal" selected>Normal</option><option value="high">High</option><option value="urgent">Urgent</option></select>'+
+    '</div>'+
+    '<div style="display:flex;gap:8px;margin-bottom:14px">'+
+      '<input class="ti" id="mtA" placeholder="Assigned to (optional)" style="flex:1">'+
+      '<input class="ti" id="mtD" placeholder="Description (optional)" style="flex:2">'+
+      '<button class="btn bg" onclick="newMT('+hid+')">+ Create</button>'+
+    '</div>'+
+    '<div class="ft">Open & recent tickets</div>'+
+    '<div class="tw"><table><thead><tr><th>#</th><th>Title</th><th>Priority</th><th>Status</th><th>Reported</th><th>Update</th></tr></thead><tbody>'+(rows||'<tr><td colspan=6 style="padding:14px;color:var(--t2)">No tickets yet</td></tr>')+'</tbody></table></div>';
+}
+async function newMT(hid){
+  const body={title:document.getElementById('mtT').value.trim(),room_number:document.getElementById('mtR').value.trim(),priority:document.getElementById('mtP').value,assigned_to:document.getElementById('mtA').value.trim(),description:document.getElementById('mtD').value.trim()};
+  if(!body.title){toast('Title required','er');return;}
+  const r=await api('/api/admin/hotels/'+hid+'/maintenance','POST',body);
+  if(r&&r.success){toast('Ticket created');openMT(hid);}
+}
+async function updMT(hid,tid){
+  const status=document.getElementById('mts_'+tid).value;
+  const r=await api('/api/admin/hotels/'+hid+'/maintenance/'+tid,'PATCH',{status});
+  if(r&&r.success){toast('Updated #'+tid+' → '+status);openMT(hid);}
+}
+
+// ── Audit Log loader ────────────────────────────────────────────────
+async function loadAudit(){
+  // Populate hotel filter (lazy)
+  const sel=document.getElementById('auHotel');
+  if(sel.options.length<=1 && allHotels.length){
+    sel.innerHTML='<option value="">All Hotels</option>'+allHotels.map(h=>'<option value="'+h.id+'">'+h.hotel_name+'</option>').join('');
+  }
+  const hid=sel.value, prefix=document.getElementById('auPrefix').value.trim();
+  const qs=[]; if(hid) qs.push('hotel_id='+hid); if(prefix) qs.push('action_prefix='+encodeURIComponent(prefix)); qs.push('limit=300');
+  const d=await api('/api/admin/audit-log?'+qs.join('&'));
+  const tb=document.getElementById('auTb');
+  const rows=d?.entries||[];
+  if(!rows.length){tb.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--t2);padding:28px">No audit entries.</td></tr>';return;}
+  tb.innerHTML=rows.map(r=>`<tr>
+    <td style="font-size:11px;color:var(--t2);font-family:monospace">${(r.created_at||'').replace('T',' ').slice(0,19)}</td>
+    <td>${(allHotels.find(h=>h.id===r.hotel_id)?.hotel_name)||(r.hotel_id||'—')}</td>
+    <td>${r.actor||'—'}</td>
+    <td><span class="tag">${r.actor_role||'—'}</span></td>
+    <td><b>${r.action||'—'}</b></td>
+    <td style="font-family:monospace;font-size:11px">${r.target||'—'}</td>
+    <td style="font-family:monospace;font-size:11px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(r.payload||'').replace(/"/g,'&quot;')}">${r.payload||''}</td>
+    <td style="font-family:monospace;font-size:11px;color:var(--t2)">${r.ip||'—'}</td>
+  </tr>`).join('');
 }
 
 async function eUser(hid,u){
@@ -461,7 +579,7 @@ async function submitH(e){
     const k=tr.querySelector('.dki')?.value.trim();
     if(k)depts.push({department:k,display_name:tr.querySelector('.dni')?.value||k,whatsapp_number:tr.querySelector('.dpi')?.value||''});
   });
-  const body={hotel_name:document.getElementById('hName').value,slug:document.getElementById('hSlug').value,instance_name:document.getElementById('hInst').value,gotenberg_url:document.getElementById('hGot').value,tagline:document.getElementById('hTag').value,logo_url:document.getElementById('hLogo').value,primary_color:document.getElementById('hPC').value,secondary_color:document.getElementById('hSC').value,background_color:document.getElementById('hBC').value,button_color:document.getElementById('hBTC').value,font_choice:document.getElementById('hFont').value,address:document.getElementById('hAddr').value,city:document.getElementById('hCity').value,google_maps_url:document.getElementById('hMaps').value,hotel_email:document.getElementById('hEmail').value,emergency_number:document.getElementById('hEM').value,wifi_name:document.getElementById('hWN').value,wifi_password:document.getElementById('hWP').value,check_in_time:document.getElementById('hCIT').value,checkout_time_display:document.getElementById('hCOT').value,welcome_message:document.getElementById('hWM').value,google_review_url:document.getElementById('hGRU').value,payment_mode:document.getElementById('hPM').value,razorpay_key_id:document.getElementById('hRK').value,razorpay_secret:document.getElementById('hRS').value,upi_id:document.getElementById('hUI').value,upi_display_name:document.getElementById('hUD').value,cloudinary_cloud_name:document.getElementById('hCCN').value,cloudinary_upload_preset:document.getElementById('hCUP').value,checkout_hour:parseInt(document.getElementById('hCOH').value)||11,late_charge_flat:parseFloat(document.getElementById('hLC').value)||500,max_late_fee:parseFloat(document.getElementById('hMLF').value)||1500,sched_daily_report_hour:parseInt(document.getElementById('hDRH').value)||7,sched_monthly_report_hour:parseInt(document.getElementById('hMRH').value)||9,sched_reminder1_hour:parseInt(document.getElementById('hR1H').value)||21,sched_reminder2_hour:parseInt(document.getElementById('hR2H').value)||10,sched_reminder2_min:parseInt(document.getElementById('hR2M').value)||30,sched_late_alert_hour:parseInt(document.getElementById('hLAH').value)||11,sched_late_alert_min:parseInt(document.getElementById('hLAM').value)||30,sched_auto_charge_hour:parseInt(document.getElementById('hACH').value)||12,sched_auto_charge_min:parseInt(document.getElementById('hACM').value)||0,rooms,departments:depts,owner_name:document.getElementById('hON').value,owner_whatsapp:document.getElementById('hOWA').value,owner_username:document.getElementById('hOU').value,owner_password:document.getElementById('hOP').value};
+  const body={hotel_name:document.getElementById('hName').value,slug:document.getElementById('hSlug').value,instance_name:document.getElementById('hInst').value,gotenberg_url:document.getElementById('hGot').value,tagline:document.getElementById('hTag').value,logo_url:document.getElementById('hLogo').value,primary_color:document.getElementById('hPC').value,secondary_color:document.getElementById('hSC').value,background_color:document.getElementById('hBC').value,button_color:document.getElementById('hBTC').value,font_choice:document.getElementById('hFont').value,address:document.getElementById('hAddr').value,city:document.getElementById('hCity').value,google_maps_url:document.getElementById('hMaps').value,hotel_email:document.getElementById('hEmail').value,emergency_number:document.getElementById('hEM').value,wifi_name:document.getElementById('hWN').value,wifi_password:document.getElementById('hWP').value,check_in_time:document.getElementById('hCIT').value,checkout_time_display:document.getElementById('hCOT').value,welcome_message:document.getElementById('hWM').value,google_review_url:document.getElementById('hGRU').value,payment_mode:document.getElementById('hPM').value,razorpay_key_id:document.getElementById('hRK').value,razorpay_secret:document.getElementById('hRS').value,razorpay_webhook_secret:(document.getElementById('hRWH')?document.getElementById('hRWH').value:''),gstin:(document.getElementById('hGSTIN')?document.getElementById('hGSTIN').value.trim().toUpperCase():''),upi_id:document.getElementById('hUI').value,upi_display_name:document.getElementById('hUD').value,cloudinary_cloud_name:document.getElementById('hCCN').value,cloudinary_upload_preset:document.getElementById('hCUP').value,checkout_hour:parseInt(document.getElementById('hCOH').value)||11,late_charge_flat:parseFloat(document.getElementById('hLC').value)||500,max_late_fee:parseFloat(document.getElementById('hMLF').value)||1500,sched_daily_report_hour:parseInt(document.getElementById('hDRH').value)||7,sched_monthly_report_hour:parseInt(document.getElementById('hMRH').value)||9,sched_reminder1_hour:parseInt(document.getElementById('hR1H').value)||21,sched_reminder2_hour:parseInt(document.getElementById('hR2H').value)||10,sched_reminder2_min:parseInt(document.getElementById('hR2M').value)||30,sched_late_alert_hour:parseInt(document.getElementById('hLAH').value)||11,sched_late_alert_min:parseInt(document.getElementById('hLAM').value)||30,sched_auto_charge_hour:parseInt(document.getElementById('hACH').value)||12,sched_auto_charge_min:parseInt(document.getElementById('hACM').value)||0,rooms,departments:depts,owner_name:document.getElementById('hON').value,owner_whatsapp:document.getElementById('hOWA').value,owner_username:document.getElementById('hOU').value,owner_password:document.getElementById('hOP').value};
   const r=await api('/api/admin/hotels','POST',body);
   if(r&&r.success){toast('✅ Hotel created!');resetForm();nav('hotels');}
   else toast('Error: '+(r?.detail||r?.error||'Failed'),'er');

@@ -504,6 +504,12 @@ async def do_checkout(bk, hotel, instance, review_url, checkout_h, late_flat, hi
     bill_h = build_bill_html(bk, charges, hotel)
     pdf = await html_to_pdf_b64(bill_h, gotenberg)
     if pdf: await send_media_b64(instance, phone, pdf, f"📄 Bill from {h_name}", "document", f"bill_{room}.pdf")
+    # Mark room as dirty so housekeeping picks it up
+    try:
+        await db.set_housekeeping_status(hid, room, "dirty",
+                                          cleaned_by="", notes=f"Auto: checkout {bk.get('booking_id','')}")
+    except Exception:
+        pass
     await send_text(instance, phone,
         f"🚪 *Checkout Complete!*\n━━━━━━━━━━━━━━━━━━\n\n"
         f"Thank you for staying at *{h_name}*! 🙏\n\n"
