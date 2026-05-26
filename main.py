@@ -40,8 +40,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="HotelFlow v2", version="2.0.0", lifespan=lifespan)
 
-app.add_middleware(CORSMiddleware, allow_origins=["*"],
-                   allow_methods=["*"], allow_headers=["*"])
+# CORS: lock down to a configured allow-list. Set CORS_ORIGINS to a comma-
+# separated list of allowed frontends (e.g. "https://hotel.example.com").
+# Use "*" only for local development; "*" disables credentialed requests.
+_cors_raw = os.getenv("CORS_ORIGINS", "*").strip()
+_cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()] or ["*"]
+_allow_credentials = _cors_origins != ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=_allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Register all routes
 app.include_router(bot_router)

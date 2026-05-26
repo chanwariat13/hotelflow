@@ -1,0 +1,36 @@
+# Source control
+.git
+.gitignore
+
+# Local env / secrets — must NEVER be baked into images
+.env
+.env.*
+*.pem
+*.key
+
+# Python build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+.vscode/
+.idea/
+
+# Build output
+dist/
+build/
+
+# Docs / scratch
+*.log
+*.bak
