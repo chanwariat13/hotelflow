@@ -478,3 +478,92 @@ async def _handle_razorpay_event(hotel: dict, body: dict):
             f"✅ *RAZORPAY PAID*\n🔖 {bid} | Room {room}\n💰 ₹{amount:.0f}\nRef: {ref}")
     except Exception as e:
         logger.exception("razorpay handler failed: %s", e)
+
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# REAL FOOD / RESTAURANT MODULE — superadmin endpoints
+# Replaces the old `menu_url` placeholder. Each hotel can manage its own
+# in-room dining menu and view incoming food orders. Food orders auto-create
+# matching stay_charge rows so they flow through the existing bill / revenue
+# pipeline without changes.
+# ══════════════════════════════════════════════════════════════════
+@router.get("/hotels/{hid}/food/items")
+async def admin_list_food_items(hid: int, request: Request):
+    await require_superadmin(request)
+    items = await db.list_food_items(hid, available_only=False)
+    cats  = await db.list_food_categories(hid)
+    return JSONResponse({"items": items, "categories": cats})
+
+
+@router.post("/hotels/{hid}/food/items")
+async def admin_create_food_item(hid: int, request: Request):
+    user = await require_superadmin(request)
+    data = await request.json()
+    if not (data.get("name") or "").strip():
+        raise HTTPException(400, "name is required")
+    item = await db.create_food_item(hid, data)
+    await audit("food.item.create", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(item.get("id", "")),
+                payload={"name": item.get("name"), "price": item.get("price")},
+                request=request)
+    return JSONResponse({"success": True, "item": item})
+
+
+@router.put("/hotels/{hid}/food/items/{item_id}")
+async def admin_update_food_item(hid: int, item_id: int, request: Request):
+    user = await require_superadmin(request)
+    data = await request.json()
+    item = await db.update_food_item(item_id, hid, data)
+    if not item:
+        raise HTTPException(404, "Food item not found")
+    await audit("food.item.update", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(item_id),
+                payload={k: v for k, v in (data or {}).items()
+                         if k in ("name", "price", "is_available", "category")},
+                request=request)
+    return JSONResponse({"success": True, "item": item})
+
+
+@router.delete("/hotels/{hid}/food/items/{item_id}")
+async def admin_delete_food_item(hid: int, item_id: int, request: Request):
+    user = await require_superadmin(request)
+    await db.delete_food_item(item_id, hid)
+    await audit("food.item.delete", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(item_id), request=request)
+    return JSONResponse({"success": True})
+
+
+@router.get("/hotels/{hid}/food/orders")
+async def admin_list_food_orders(hid: int, request: Request):
+    await require_superadmin(request)
+    status = request.query_params.get("status") or None
+    orders = await db.list_food_orders(hid, status=status, limit=200)
+    for o in orders:
+        for k in ("created_at", "updated_at", "delivered_at"):
+            if o.get(k):
+                o[k] = o[k].isoformat()
+    return JSONResponse({"orders": orders})
+
+
+@router.patch("/hotels/{hid}/food/orders/{order_id}")
+async def admin_update_food_order(hid: int, order_id: int, request: Request):
+    user = await require_superadmin(request)
+    data = await request.json()
+    new_status = (data.get("status") or "").strip()
+    if not new_status:
+        raise HTTPException(400, "status is required")
+    try:
+        order = await db.update_food_order_status(order_id, hid, new_status)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not order:
+        raise HTTPException(404, "Food order not found")
+    await audit("food.order.status", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(order_id),
+                payload={"status": new_status}, request=request)
+    for k in ("created_at", "updated_at", "delivered_at"):
+        if order.get(k):
+            order[k] = order[k].isoformat()
+    return JSONResponse({"success": True, "order": order})

@@ -167,6 +167,8 @@ async def ensure_schema_v2():
       - audit_log:           append-only privileged-action log
       - housekeeping_log:    cleaning history per room
       - maintenance_tickets: room/area maintenance tracking
+      - hotel_food_items:    real food/restaurant menu (replaces menu_url string)
+      - hotel_food_orders:   guest food orders linked to bookings
       - hotels.gstin                    (B2B tax invoice)
       - hotels.razorpay_webhook_secret  (for signed webhook)
       - bookings.customer_gstin         (B2B guest GSTIN on bill)
@@ -233,7 +235,57 @@ async def ensure_schema_v2():
         await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_by         VARCHAR(100) DEFAULT ''")
         await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_at         TIMESTAMP")
 
-        logger.info("✅ schema_v2 ensured (audit_log, housekeeping_log, maintenance_tickets, gstin, webhook_secret)")
+        # 3. Real food/restaurant module — replaces the "menu_url is just a string"
+        #    placeholder with actual menu storage and order tracking. Each food
+        #    order is mirrored as a stay_charge of service_type='Food' so the
+        #    existing bill / revenue / payment flows pick it up unchanged.
+        await execute("""
+            CREATE TABLE IF NOT EXISTS hotel_food_items (
+                id              SERIAL PRIMARY KEY,
+                hotel_id        INTEGER      NOT NULL,
+                category        VARCHAR(80)  DEFAULT 'Other',
+                name            VARCHAR(150) NOT NULL,
+                description     TEXT         DEFAULT '',
+                price           NUMERIC(10,2) NOT NULL DEFAULT 0,
+                image_url       TEXT         DEFAULT '',
+                type            VARCHAR(20)  DEFAULT 'veg',         -- veg / nonveg / egg
+                is_available    BOOLEAN      DEFAULT TRUE,
+                is_bestseller   BOOLEAN      DEFAULT FALSE,
+                spice_level     VARCHAR(20)  DEFAULT '',            -- mild / medium / spicy / ''
+                serving_hours   VARCHAR(50)  DEFAULT '',            -- e.g. 'breakfast', '7am-11pm'
+                sort_order      INTEGER      DEFAULT 0,
+                created_at      TIMESTAMP    DEFAULT NOW(),
+                updated_at      TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_food_items_hotel ON hotel_food_items(hotel_id, is_available)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_food_items_cat   ON hotel_food_items(hotel_id, category)")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS hotel_food_orders (
+                id              SERIAL PRIMARY KEY,
+                hotel_id        INTEGER      NOT NULL,
+                booking_id      VARCHAR(40)  DEFAULT '',
+                room_number     VARCHAR(20)  DEFAULT '',
+                guest_phone     VARCHAR(20)  DEFAULT '',
+                guest_name      VARCHAR(150) DEFAULT '',
+                items_json      JSONB        NOT NULL DEFAULT '[]'::jsonb, -- [{food_item_id,name,price,qty}]
+                subtotal        NUMERIC(10,2) DEFAULT 0,
+                tax             NUMERIC(10,2) DEFAULT 0,
+                total           NUMERIC(10,2) DEFAULT 0,
+                notes           TEXT         DEFAULT '',
+                status          VARCHAR(20)  DEFAULT 'Placed',     -- Placed / Preparing / Ready / Delivered / Cancelled
+                stay_charge_id  INTEGER,                            -- link back to stay_charges row
+                created_at      TIMESTAMP    DEFAULT NOW(),
+                updated_at      TIMESTAMP    DEFAULT NOW(),
+                delivered_at    TIMESTAMP
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_hotel  ON hotel_food_orders(hotel_id, status)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_booking ON hotel_food_orders(booking_id)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_room    ON hotel_food_orders(room_number, status)")
+
+        logger.info("✅ schema_v2 ensured (audit_log, housekeeping_log, maintenance_tickets, gstin, webhook_secret, hotel_food_items, hotel_food_orders)")
     except Exception as e:
         logger.exception("ensure_schema_v2 failed: %s", e)
 
@@ -886,3 +938,255 @@ async def lookup_returning_guest(hid: int, phone: str) -> Optional[Dict]:
         "total_visits": int(row["total_visits"] or 0),
         "last_visit": row["last_visit"].isoformat() if row.get("last_visit") else "",
     }
+
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# REAL FOOD / RESTAURANT MODULE  (replaces menu_url placeholder)
+# ══════════════════════════════════════════════════════════════════
+import json as _json
+
+FOOD_ORDER_STATUSES = ("Placed", "Preparing", "Ready", "Delivered", "Cancelled")
+
+
+# ── Menu items (food) ─────────────────────────────────────────────
+async def list_food_items(hid: int, available_only: bool = False) -> List[Dict]:
+    """All food items for a hotel, ordered for menu display.
+
+    `available_only=True` is what the guest-facing endpoints use; the admin
+    UI passes False so unavailable items are still editable.
+    """
+    where = "hotel_id=$1"
+    if available_only:
+        where += " AND is_available=TRUE"
+    return await fetch(
+        f"SELECT * FROM hotel_food_items WHERE {where} "
+        f"ORDER BY category, sort_order, name", hid,
+    )
+
+
+async def get_food_item(item_id: int, hid: int) -> Optional[Dict]:
+    return await fetchrow(
+        "SELECT * FROM hotel_food_items WHERE id=$1 AND hotel_id=$2",
+        item_id, hid,
+    )
+
+
+async def create_food_item(hid: int, data: Dict) -> Dict:
+    row = await fetchrow(
+        """INSERT INTO hotel_food_items
+           (hotel_id, category, name, description, price, image_url, type,
+            is_available, is_bestseller, spice_level, serving_hours, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""",
+        hid,
+        (data.get("category") or "Other").strip()[:80],
+        (data.get("name") or "").strip()[:150],
+        data.get("description") or "",
+        float(data.get("price", 0)),
+        data.get("image_url") or "",
+        (data.get("type") or "veg").strip().lower()[:20],
+        bool(data.get("is_available", True)),
+        bool(data.get("is_bestseller", False)),
+        (data.get("spice_level") or "").strip()[:20],
+        (data.get("serving_hours") or "").strip()[:50],
+        int(data.get("sort_order", 0)),
+    )
+    return dict(row) if row else {}
+
+
+async def update_food_item(item_id: int, hid: int, data: Dict) -> Optional[Dict]:
+    allowed = ("category", "name", "description", "price", "image_url",
+               "type", "is_available", "is_bestseller", "spice_level",
+               "serving_hours", "sort_order")
+    fields, vals, i = [], [], 1
+    for k, v in (data or {}).items():
+        if k in allowed:
+            fields.append(f"{k}=${i}")
+            vals.append(v)
+            i += 1
+    if not fields:
+        return await get_food_item(item_id, hid)
+    fields.append("updated_at=NOW()")
+    vals += [item_id, hid]
+    return await fetchrow(
+        f"UPDATE hotel_food_items SET {','.join(fields)} "
+        f"WHERE id=${i} AND hotel_id=${i+1} RETURNING *",
+        *vals,
+    )
+
+
+async def delete_food_item(item_id: int, hid: int):
+    """Hard delete is fine here — food items aren't referenced from order rows
+    by id (we snapshot name/price into the order at the time of placement)."""
+    await execute(
+        "DELETE FROM hotel_food_items WHERE id=$1 AND hotel_id=$2",
+        item_id, hid,
+    )
+
+
+async def list_food_categories(hid: int) -> List[str]:
+    """Distinct categories used by this hotel's food items, ordered by usage."""
+    rows = await fetch(
+        """SELECT category, COUNT(*) AS n FROM hotel_food_items
+           WHERE hotel_id=$1 GROUP BY category ORDER BY n DESC, category""",
+        hid,
+    )
+    return [r["category"] for r in rows]
+
+
+# ── Food orders ───────────────────────────────────────────────────
+async def list_food_orders(hid: int, status: Optional[str] = None,
+                            limit: int = 100) -> List[Dict]:
+    if status:
+        return await fetch(
+            "SELECT * FROM hotel_food_orders WHERE hotel_id=$1 AND status=$2 "
+            "ORDER BY id DESC LIMIT $3", hid, status, limit,
+        )
+    return await fetch(
+        """SELECT * FROM hotel_food_orders WHERE hotel_id=$1
+           ORDER BY CASE WHEN status IN ('Placed','Preparing','Ready') THEN 0 ELSE 1 END,
+                    id DESC LIMIT $2""",
+        hid, limit,
+    )
+
+
+async def get_food_order(order_id: int, hid: int) -> Optional[Dict]:
+    return await fetchrow(
+        "SELECT * FROM hotel_food_orders WHERE id=$1 AND hotel_id=$2",
+        order_id, hid,
+    )
+
+
+async def create_food_order(hid: int, data: Dict) -> Dict:
+    """
+    Create a food order AND mirror it as a stay_charge so the existing bill /
+    revenue flows naturally include food spend without extra plumbing.
+
+    Caller passes: booking_id, room_number, guest_phone, guest_name, items
+    where items is [{food_item_id, qty}]. We re-resolve each item's price from
+    the DB (server-authoritative) and snapshot {name, price, qty} into items_json.
+    """
+    booking_id  = (data.get("booking_id") or "").strip()
+    room_number = (data.get("room_number") or "").strip()
+    guest_phone = (data.get("guest_phone") or "").strip()
+    guest_name  = (data.get("guest_name") or "").strip()
+    notes       = (data.get("notes") or "").strip()
+    raw_items   = data.get("items") or []
+
+    if not raw_items:
+        raise ValueError("items is required")
+
+    # Resolve and snapshot each item from the DB
+    snapshot: list[dict] = []
+    item_ids = [int(i.get("food_item_id")) for i in raw_items
+                 if i.get("food_item_id") is not None]
+    if not item_ids:
+        raise ValueError("each item must have food_item_id")
+
+    rows = await fetch(
+        "SELECT id,name,price,is_available FROM hotel_food_items "
+        "WHERE id=ANY($1::int[]) AND hotel_id=$2",
+        item_ids, hid,
+    )
+    by_id = {int(r["id"]): r for r in rows}
+    for it in raw_items:
+        fid = int(it.get("food_item_id"))
+        qty = int(it.get("qty", 1))
+        if qty <= 0:
+            continue
+        row = by_id.get(fid)
+        if not row:
+            raise ValueError(f"food item {fid} not found")
+        if not row["is_available"]:
+            raise ValueError(f"'{row['name']}' is unavailable")
+        snapshot.append({
+            "food_item_id": fid,
+            "name":         row["name"],
+            "price":        float(row["price"] or 0),
+            "qty":          qty,
+        })
+
+    if not snapshot:
+        raise ValueError("no valid items")
+
+    subtotal = round(sum(s["price"] * s["qty"] for s in snapshot), 2)
+    tax      = 0.0   # future: pull GST per item; food rules vary by hotel
+    total    = round(subtotal + tax, 2)
+
+    # 1. Insert the food order itself
+    order = await fetchrow(
+        """INSERT INTO hotel_food_orders
+           (hotel_id, booking_id, room_number, guest_phone, guest_name,
+            items_json, subtotal, tax, total, notes, status)
+           VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,'Placed') RETURNING *""",
+        hid, booking_id, room_number, guest_phone, guest_name,
+        _json.dumps(snapshot), subtotal, tax, total, notes,
+    )
+    order_id = order["id"]
+
+    # 2. Mirror to stay_charges so the bill picks it up. Skipped for walk-in
+    #    food orders that aren't tied to a booking (rare, but supported).
+    charge_id = None
+    if booking_id:
+        descr = ", ".join(f"{s['qty']}x {s['name']}" for s in snapshot)[:200]
+        await insert_stay_charge({
+            "booking_id":     booking_id,
+            "service_type":   "Food",
+            "description":    descr or f"Food order #{order_id}",
+            "amount":         total,
+            "tax":            tax,
+            "total":          total,
+            "payment_status": "Pending",
+            "order_ref":      f"FOOD#{order_id}",
+            "hotel_id":       hid,
+        })
+        charge_id = await fetchval(
+            "SELECT id FROM stay_charges WHERE order_ref=$1 LIMIT 1",
+            f"FOOD#{order_id}",
+        )
+        if charge_id:
+            await execute(
+                "UPDATE hotel_food_orders SET stay_charge_id=$1 WHERE id=$2",
+                charge_id, order_id,
+            )
+
+    out = dict(order)
+    out["items"] = snapshot   # return parsed for convenience
+    out["stay_charge_id"] = charge_id
+    return out
+
+
+async def update_food_order_status(order_id: int, hid: int, status: str) -> Optional[Dict]:
+    if status not in FOOD_ORDER_STATUSES:
+        raise ValueError(f"invalid status '{status}' (allowed: {FOOD_ORDER_STATUSES})")
+    fields = ["status=$1", "updated_at=NOW()"]
+    vals: list = [status]
+    if status == "Delivered":
+        fields.append("delivered_at=NOW()")
+    if status == "Cancelled":
+        # Soft-cancel the linked charge so it disappears from the bill total
+        order = await get_food_order(order_id, hid)
+        if order and order.get("stay_charge_id"):
+            await execute(
+                "UPDATE stay_charges SET payment_status='Cancelled' "
+                "WHERE id=$1 AND payment_status='Pending'",
+                order["stay_charge_id"],
+            )
+    vals += [order_id, hid]
+    return await fetchrow(
+        f"UPDATE hotel_food_orders SET {','.join(fields)} "
+        f"WHERE id=${len(vals)-1} AND hotel_id=${len(vals)} RETURNING *",
+        *vals,
+    )
+
+
+async def get_active_food_orders_for_room(hid: int, room: str) -> List[Dict]:
+    """Used by the bot when a guest asks about their food order status."""
+    return await fetch(
+        """SELECT * FROM hotel_food_orders
+           WHERE hotel_id=$1 AND room_number=$2
+             AND status IN ('Placed','Preparing','Ready')
+           ORDER BY id DESC""",
+        hid, room,
+    )

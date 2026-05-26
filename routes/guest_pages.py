@@ -544,3 +544,383 @@ async def api_service(request: Request):
     await send_text(hotel["instance_name"], phone,
         f"✅ *Request Received!*\n🛎️ {svc[:60]}\n🔖 {sr_id}\n\nOur team will attend shortly. 🙏")
     return JSONResponse({"success":True,"request_id":sr_id})
+
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# REAL FOOD / RESTAURANT — guest-facing page + APIs
+# /food/{slug}                    → mobile-first menu page (themed)
+# GET  /api/guest/food/menu       → menu JSON (categories + items)
+# POST /api/guest/food/order      → place an order (creates stay_charge)
+# GET  /api/guest/food/my-orders  → live status of guest's recent orders
+# ══════════════════════════════════════════════════════════════════
+@router.get("/food/{slug}", response_class=HTMLResponse)
+async def food_page(slug: str, request: Request):
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        raise HTTPException(404)
+    pri = hotel.get("primary_color", "#c8a84b")
+    body = f"""
+<div class="card" id="initCard">
+  <div class="ct">🍽️ Order Food to Your Room</div>
+  <p style="font-size:13px;opacity:.65;margin-bottom:12px">Enter your room and WhatsApp number to start.</p>
+  <label>Room Number</label>
+  <input type="text" id="roomInp" placeholder="e.g. 101" style="text-transform:uppercase">
+  <label>Your WhatsApp Number</label>
+  <input type="tel" id="phoneInp" placeholder="91XXXXXXXXXX">
+  <button class="btn" onclick="initGuest()" style="margin-top:11px">View Menu →</button>
+</div>
+
+<div id="menuCard" style="display:none">
+  <div class="card" id="gInfoCard" style="display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <div style="font-size:13px;color:{pri};font-weight:600" id="gInfo"></div>
+      <div style="font-size:11px;opacity:.55" id="gSub"></div>
+    </div>
+    <div class="btn" style="width:auto;padding:8px 14px;font-size:13px;margin-top:0" onclick="openCart()">
+      🛒 Cart <span id="cartCount">0</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="ct">Filter</div>
+    <input type="text" id="searchInp" placeholder="Search dishes..." oninput="renderMenu()" style="margin-bottom:8px">
+    <div id="catBar" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+  </div>
+
+  <div id="menuList"></div>
+</div>
+
+<!-- CART DRAWER -->
+<div id="cartOverlay" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200" onclick="closeCart()"></div>
+<div id="cartDrawer" style="display:none;position:fixed;bottom:0;left:0;right:0;background:var(--bg);border-top:2px solid {pri};border-radius:20px 20px 0 0;z-index:201;max-height:80vh;overflow-y:auto;padding:18px;color:var(--t)">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div style="font-size:16px;font-weight:700;color:{pri}">🛒 Your Order</div>
+    <div onclick="closeCart()" style="cursor:pointer;font-size:22px;opacity:.6">×</div>
+  </div>
+  <div id="cartItems"></div>
+  <textarea id="orderNotes" placeholder="Special instructions (optional)..." style="width:100%;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.12);color:var(--t);padding:9px 11px;border-radius:7px;font-size:13px;margin-top:10px;font-family:inherit;min-height:60px;resize:none"></textarea>
+  <div id="cartTotal" style="font-weight:700;margin-top:12px;color:{pri};text-align:right;font-size:15px"></div>
+  <button class="btn" onclick="placeOrder()" id="placeBtn" style="margin-top:10px">📤 Place Order</button>
+</div>
+
+<!-- MY ORDERS -->
+<div id="myOrders" style="display:none;margin-top:16px"></div>
+
+<script>
+const SLUG='{slug}';
+let MENU=[],CATS=[],activeCat='All',gRoom='',gPhone='',gName='',gBid='';
+let cart={{}};
+
+async function initGuest(){{
+  gRoom=document.getElementById('roomInp').value.trim().toUpperCase();
+  gPhone=document.getElementById('phoneInp').value.trim();
+  if(!gRoom||!gPhone){{showToast('Enter room and phone',false);return;}}
+  const r=await fetch('/api/guest/session?phone='+gPhone);
+  const d=await r.json();
+  if(!d.found){{showToast('No active booking for this number. Please register first.',false);return;}}
+  gName=d.name||'Guest';
+  gBid=d.booking_id||'';
+  document.getElementById('gInfo').textContent=`Room ${{gRoom}} · ${{gName}}`;
+  document.getElementById('gSub').textContent='Tap any dish to add it to your order';
+  document.getElementById('initCard').style.display='none';
+  document.getElementById('menuCard').style.display='block';
+  await loadMenu();
+  await loadMyOrders();
+}}
+
+async function loadMenu(){{
+  const r=await fetch('/api/guest/food/menu?slug='+SLUG);
+  const d=await r.json();
+  if(!d.items){{ document.getElementById('menuList').innerHTML='<div class="card"><p style="opacity:.5;text-align:center">No menu yet — please ask reception.</p></div>'; return; }}
+  MENU=d.items; CATS=['All', ...(d.categories||[])];
+  renderCats();
+  renderMenu();
+}}
+
+function renderCats(){{
+  const bar=document.getElementById('catBar');
+  bar.innerHTML=CATS.map(c=>`<span style="padding:5px 12px;border-radius:14px;font-size:11px;cursor:pointer;border:1px solid ${{c===activeCat?'var(--p)':'rgba(255,255,255,.15)'}};background:${{c===activeCat?'rgba(200,168,75,.18)':'transparent'}};color:${{c===activeCat?'var(--p)':'rgba(255,255,255,.65)'}}" onclick="filterCat('${{c.replace(/'/g,"\\\\'")}}')">${{c}}</span>`).join('');
+}}
+function filterCat(c){{ activeCat=c; renderCats(); renderMenu(); }}
+
+function renderMenu(){{
+  const q=(document.getElementById('searchInp').value||'').toLowerCase();
+  const filtered=MENU.filter(m=>(activeCat==='All'||m.category===activeCat) &&
+                                  (m.name.toLowerCase().includes(q) || (m.description||'').toLowerCase().includes(q)));
+  if(!filtered.length){{ document.getElementById('menuList').innerHTML='<div class="card"><p style="opacity:.5;text-align:center">No dishes match.</p></div>'; return; }}
+  // group by category
+  const groups={{}};
+  filtered.forEach(m=>{{ (groups[m.category]=groups[m.category]||[]).push(m); }});
+  let h='';
+  Object.keys(groups).forEach(cat=>{{
+    h+=`<div class="ctitle">🍽 ${{cat}}</div>`;
+    groups[cat].forEach(m=>{{
+      const dot = m.type==='nonveg' ? '🔴' : (m.type==='egg' ? '🟡' : '🟢');
+      const star= m.is_bestseller ? '<span style="color:#ffd166;font-size:10px;margin-left:4px">⭐ Best</span>' : '';
+      const dis = !m.is_available ? 'opacity:.4;pointer-events:none' : '';
+      const inCart = cart[m.id] ? cart[m.id].qty : 0;
+      const qtyHtml = inCart>0
+        ? `<div style="display:flex;align-items:center;gap:8px"><button class="qb" onclick="changeQty(${{m.id}},-1)">−</button><span style="min-width:18px;text-align:center;font-weight:600">${{inCart}}</span><button class="qb" onclick="changeQty(${{m.id}},1)">+</button></div>`
+        : `<button class="addb" onclick="changeQty(${{m.id}},1)">+ Add</button>`;
+      const img = m.image_url ? `<img src="${{m.image_url}}" style="width:54px;height:54px;border-radius:8px;object-fit:cover;flex-shrink:0">` : '';
+      h+=`<div class="scard" style="${{dis}};display:flex;justify-content:space-between;align-items:center;gap:11px">
+        ${{img}}
+        <div style="flex:1;min-width:0">
+          <div style="display:flex;align-items:center;gap:5px"><b style="font-size:14px">${{dot}} ${{m.name}}</b>${{star}}</div>
+          ${{m.description ? `<div style="font-size:11px;opacity:.55;margin-top:2px">${{m.description}}</div>` : ''}}
+          <div style="font-weight:600;color:var(--p);margin-top:4px">₹${{Math.round(m.price)}}</div>
+        </div>
+        <div>${{!m.is_available ? '<span style="opacity:.5;font-size:11px">Unavailable</span>' : qtyHtml}}</div>
+      </div>`;
+    }});
+  }});
+  document.getElementById('menuList').innerHTML=h;
+}}
+
+function changeQty(id,delta){{
+  const item=MENU.find(m=>m.id===id);
+  if(!item)return;
+  const cur=cart[id]?cart[id].qty:0;
+  const next=Math.max(0,cur+delta);
+  if(next===0) delete cart[id];
+  else cart[id]={{item,qty:next}};
+  renderMenu();
+  updateCartBadge();
+}}
+
+function updateCartBadge(){{
+  const n=Object.values(cart).reduce((s,c)=>s+c.qty,0);
+  document.getElementById('cartCount').textContent=n;
+  if(document.getElementById('cartDrawer').style.display==='block') renderCart();
+}}
+
+function openCart(){{
+  document.getElementById('cartOverlay').style.display='block';
+  document.getElementById('cartDrawer').style.display='block';
+  renderCart();
+}}
+function closeCart(){{
+  document.getElementById('cartOverlay').style.display='none';
+  document.getElementById('cartDrawer').style.display='none';
+}}
+
+function renderCart(){{
+  const items=Object.values(cart);
+  const list=document.getElementById('cartItems');
+  if(!items.length){{
+    list.innerHTML='<p style="opacity:.5;text-align:center;padding:18px">Cart is empty</p>';
+    document.getElementById('cartTotal').textContent='';
+    document.getElementById('placeBtn').disabled=true;
+    return;
+  }}
+  let h='',total=0;
+  items.forEach(c=>{{
+    const lt=c.item.price*c.qty; total+=lt;
+    h+=`<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.07);font-size:13px">
+      <div><div>${{c.item.name}}</div><div style="font-size:11px;opacity:.5">₹${{Math.round(c.item.price)}} each</div></div>
+      <div style="display:flex;align-items:center;gap:9px">
+        <button class="qb" onclick="changeQty(${{c.item.id}},-1)">−</button>
+        <span style="min-width:18px;text-align:center;font-weight:600">${{c.qty}}</span>
+        <button class="qb" onclick="changeQty(${{c.item.id}},1)">+</button>
+        <span style="font-weight:600;min-width:50px;text-align:right">₹${{Math.round(lt)}}</span>
+      </div>
+    </div>`;
+  }});
+  list.innerHTML=h;
+  document.getElementById('cartTotal').textContent='Total: ₹'+Math.round(total);
+  document.getElementById('placeBtn').disabled=false;
+}}
+
+async function placeOrder(){{
+  const items=Object.values(cart).map(c=>({{food_item_id:c.item.id,qty:c.qty}}));
+  if(!items.length) return;
+  const btn=document.getElementById('placeBtn');
+  btn.disabled=true; btn.textContent='Placing...';
+  try{{
+    const r=await fetch('/api/guest/food/order',{{method:'POST',headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{slug:SLUG, room:gRoom, phone:gPhone, booking_id:gBid,
+        items, notes: document.getElementById('orderNotes').value.trim()}})}});
+    const d=await r.json();
+    if(d.success){{
+      cart={{}};
+      document.getElementById('orderNotes').value='';
+      updateCartBadge();
+      closeCart();
+      showToast('✅ Order placed! Reception will confirm.');
+      renderMenu();
+      loadMyOrders();
+    }}else{{
+      showToast('❌ '+(d.error||'Failed'),false);
+      btn.disabled=false; btn.textContent='📤 Place Order';
+    }}
+  }}catch(e){{
+    showToast('Network error',false);
+    btn.disabled=false; btn.textContent='📤 Place Order';
+  }}
+}}
+
+async function loadMyOrders(){{
+  if(!gPhone) return;
+  const r=await fetch('/api/guest/food/my-orders?slug='+SLUG+'&phone='+gPhone);
+  const d=await r.json();
+  const wrap=document.getElementById('myOrders');
+  if(!d.orders||!d.orders.length){{ wrap.style.display='none'; return; }}
+  let h='<div class="card"><div class="ct">📋 Your Orders</div>';
+  d.orders.forEach(o=>{{
+    const items=(o.items_json||[]).map(it=>`${{it.qty}}x ${{it.name}}`).join(', ');
+    const colors={{Placed:'#7d8590',Preparing:'#d29922',Ready:'#3fb950',Delivered:'#3fb950',Cancelled:'#f85149'}};
+    h+=`<div style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,.07);font-size:13px">
+      <div style="display:flex;justify-content:space-between"><b>#${{o.id}}</b>
+        <span style="color:${{colors[o.status]||'#aaa'}};font-size:11px;font-weight:600">● ${{o.status}}</span></div>
+      <div style="opacity:.65;font-size:11px;margin:2px 0">${{items}}</div>
+      <div style="text-align:right;color:var(--p);font-weight:600">₹${{Math.round(o.total)}}</div>
+    </div>`;
+  }});
+  h+='</div>';
+  wrap.innerHTML=h;
+  wrap.style.display='block';
+}}
+
+const urlP=new URLSearchParams(window.location.search);
+if(urlP.get('r')) document.getElementById('roomInp').value=urlP.get('r');
+if(urlP.get('p')) {{
+  document.getElementById('phoneInp').value=urlP.get('p');
+  if(urlP.get('r')) setTimeout(initGuest,200);
+}}
+// Auto-refresh "my orders" every 20s so guests see "Ready"/"Delivered" updates
+setInterval(()=>{{ if(gPhone) loadMyOrders(); }}, 20000);
+</script>
+<style>
+.qb {{ width:26px; height:26px; border-radius:50%; border:1px solid var(--p); background:transparent; color:var(--p); font-size:14px; cursor:pointer; line-height:1; }}
+.qb:hover {{ background:var(--p); color:#000; }}
+.addb {{ background:var(--btn); color:#000; font-size:12px; font-weight:600; padding:6px 12px; border-radius:7px; border:none; cursor:pointer; }}
+</style>
+"""
+    return HTMLResponse(themed(hotel, "Order Food", body))
+
+
+@router.get("/api/guest/food/menu")
+async def api_food_menu(slug: str = ""):
+    """Public food menu for a hotel — only available items, no admin fields."""
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        return JSONResponse({"items": [], "categories": []})
+    items = await db.list_food_items(hotel["id"], available_only=True)
+    cats  = await db.list_food_categories(hotel["id"])
+    # Trim to public-safe fields
+    public = [{
+        "id":            it["id"],
+        "category":      it["category"],
+        "name":          it["name"],
+        "description":   it["description"] or "",
+        "price":         float(it["price"] or 0),
+        "image_url":     it["image_url"] or "",
+        "type":          (it["type"] or "veg").lower(),
+        "is_available":  bool(it["is_available"]),
+        "is_bestseller": bool(it["is_bestseller"]),
+        "spice_level":   it.get("spice_level") or "",
+    } for it in items]
+    return JSONResponse({"items": public, "categories": cats})
+
+
+@router.post("/api/guest/food/order")
+async def api_food_order(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON"}, 400)
+
+    slug   = body.get("slug", "")
+    hotel  = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        return JSONResponse({"success": False, "error": "Hotel not found"}, 404)
+
+    phone  = (body.get("phone") or "").strip()
+    room   = (body.get("room") or "").strip().upper()
+    bid    = (body.get("booking_id") or "").strip()
+    items  = body.get("items") or []
+    notes  = (body.get("notes") or "").strip()
+
+    if not phone or not items:
+        return JSONResponse({"success": False, "error": "phone and items are required"}, 400)
+
+    # If caller didn't pass a booking_id, look it up from the active session
+    # so the order links back to the room bill.
+    name = ""
+    if not bid or not room:
+        booking = await db.get_active_booking_by_phone(phone, hotel["id"])
+        if booking:
+            bid  = bid  or booking["booking_id"]
+            room = room or booking["room_number"]
+            name = booking["guest_name"]
+
+    try:
+        order = await db.create_food_order(hotel["id"], {
+            "booking_id":  bid,
+            "room_number": room,
+            "guest_phone": phone,
+            "guest_name":  name,
+            "items":       items,
+            "notes":       notes,
+        })
+    except ValueError as e:
+        return JSONResponse({"success": False, "error": str(e)}, 400)
+
+    # Notify kitchen / staff
+    try:
+        from services.whatsapp import send_to_phones, send_text
+        staff_phones = await db.get_staff_phones(hotel["id"])
+        item_lines = "\n".join(
+            f"  • {s['qty']}x {s['name']} (₹{int(s['price'])})"
+            for s in order.get("items", [])
+        )
+        notes_line = f"\n📝 {notes}" if notes else ""
+        await send_to_phones(hotel["instance_name"], staff_phones,
+            f"🍽️ *NEW FOOD ORDER #{order['id']}*\n━━━━━━━━━━━━━━━━━━\n"
+            f"🏨 Room: *{room}*\n👤 {name or phone}\n📱 {phone}\n\n"
+            f"{item_lines}{notes_line}\n\n"
+            f"💰 ₹{float(order['total']):.0f}\n\n"
+            f"✅ When ready: *FOOD READY R{room}* (or update from dashboard)"
+        )
+        await send_text(hotel["instance_name"], phone,
+            f"✅ *Order Received!*\n🍽️ Room {room}\n\n{item_lines}\n\n"
+            f"💰 ₹{float(order['total']):.0f} added to your bill.\n\n"
+            f"We'll notify you when it's ready! 🙏")
+    except Exception:
+        pass  # never fail the order over notification issues
+
+    return JSONResponse({
+        "success":  True,
+        "order_id": order["id"],
+        "total":    float(order["total"]),
+        "items":    order.get("items", []),
+        "status":   order["status"],
+    })
+
+
+@router.get("/api/guest/food/my-orders")
+async def api_food_my_orders(slug: str = "", phone: str = ""):
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel or not phone:
+        return JSONResponse({"orders": []})
+    rows = await db.fetch(
+        "SELECT id, status, items_json, subtotal, tax, total, notes, created_at, delivered_at "
+        "FROM hotel_food_orders WHERE hotel_id=$1 AND guest_phone=$2 "
+        "ORDER BY id DESC LIMIT 10",
+        hotel["id"], phone,
+    )
+    out = []
+    for r in rows:
+        d = dict(r)
+        # JSONB → already a python list of dicts via asyncpg
+        if d.get("created_at"):
+            d["created_at"] = d["created_at"].isoformat()
+        if d.get("delivered_at"):
+            d["delivered_at"] = d["delivered_at"].isoformat()
+        d["subtotal"] = float(d.get("subtotal") or 0)
+        d["tax"]      = float(d.get("tax") or 0)
+        d["total"]    = float(d.get("total") or 0)
+        out.append(d)
+    return JSONResponse({"orders": out})

@@ -262,11 +262,22 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # FOOD DONE R<room>
     m = re.match(r"^FOOD\s+DONE\s+R(\w+)$", UP)
     if m:
-        bk = await db.get_active_booking_by_room(m.group(1), hid)
+        room = m.group(1)
+        bk = await db.get_active_booking_by_room(room, hid)
+        # Mark the most recent in-progress food order(s) as Delivered so the
+        # dashboard / "my orders" view updates and the "ready" badge clears.
+        try:
+            active = await db.get_active_food_orders_for_room(hid, room)
+            for o in active:
+                await db.update_food_order_status(o["id"], hid, "Delivered")
+        except Exception:
+            pass
         if bk:
             await send_text(instance, bk["guest_phone"],
-                f"🍽️ *Your order has been delivered!*\n🏨 Room {m.group(1)}\n\nEnjoy your meal! 😊")
-            await send_text(instance, phone, f"✅ Food delivered confirmation sent to Room {m.group(1)}")
+                f"🍽️ *Your order has been delivered!*\n🏨 Room {room}\n\nEnjoy your meal! 😊")
+            await send_text(instance, phone, f"✅ Food delivered confirmation sent to Room {room}")
+        else:
+            await send_text(instance, phone, f"⚠️ No active booking for Room {room}")
         return
 
     # ADMIN / HELP
@@ -280,9 +291,10 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
             f"📊 STATUS R<room>\n🏨 ROOMS\n💰 SALES\n📱 QR R<room>\n"
             f"🚫 BLOCK <phone>\n✅ UNBLOCK <phone>\n"
             f"📢 BROADCAST <message>\n✓ DONE <SR_ID>\n"
-            f"🍽️ FOOD DONE R<room>\n"
+            f"🍽️ FOOD DONE R<room> (mark food orders delivered)\n"
             f"📅 EXTEND CONFIRM <bkid> <date>\n"
-            f"━━━━━━━━━━━━━━━━━━\n🖥️ Dashboard: /hotel/{hotel['slug']}")
+            f"━━━━━━━━━━━━━━━━━━\n🖥️ Dashboard: /hotel/{hotel['slug']}\n"
+            f"🍽️ Manage food menu + orders from the dashboard")
         return
 
     await send_text(instance, phone, f"⚠️ Unknown command. Type *ADMIN* to see all commands.")
@@ -313,26 +325,60 @@ async def handle_guest(phone, text, UP, session, hotel, instance, hid, h_name,
 
     # HI / HELLO / HELP / MENU
     if UP in ("HI","HELLO","HEY","START","HELP","MENU","HOME"):
-        svc_url = f"{BASE_URL}/menu/{slug}?r={room}&p={phone}"
+        food_url = f"{BASE_URL}/food/{slug}?r={room}&p={phone}"
+        svc_url  = f"{BASE_URL}/menu/{slug}?r={room}&p={phone}"
         bill_url = f"{BASE_URL}/bill/{slug}?phone={phone}"
         await send_text(instance, phone,
             f"👋 *Namaste {fname}!*\n\n🏨 Room: *{room}*\n📅 Checkout: {fmt_date(co_date)}\n\n"
             f"━━━━━━━━━━━━━━━━━━\n*How can I help you?*\n\n"
-            f"1️⃣ *menu* — Food & room service\n2️⃣ *my bill* — View charges\n"
+            f"1️⃣ *menu* — Order food to your room\n2️⃣ *my bill* — View charges\n"
             f"3️⃣ *pay online* — Pay bill online\n4️⃣ *upi* — Pay via UPI QR\n"
             f"5️⃣ *pay cash* — Pay cash\n6️⃣ *checkout* — Checkout\n"
             f"7️⃣ *extend* — Extend stay\n\n"
-            f"🛎️ Services: {svc_url}\n💰 Bill: {bill_url}\n\n"
+            f"🍽️ Food: {food_url}\n🛎️ Services: {svc_url}\n💰 Bill: {bill_url}\n\n"
             f"📞 Emergency: {emergency}\n📶 WiFi: {wifi_name} / {wifi_pw}")
         return
 
     # FOOD / ORDER / MENU
     if any(UP.startswith(k) for k in ("MENU","FOOD","ORDER","1 ")):
-        svc_url = f"{BASE_URL}/menu/{slug}?r={room}&p={phone}&n={fname}&b={bid}"
+        # Pull real items from the new food module. Fall back to the legacy
+        # menu_url string if the hotel hasn't built a menu yet.
+        items = await db.list_food_items(hid, available_only=True)
+        svc_url = f"{BASE_URL}/food/{slug}?r={room}&p={phone}&n={fname}&b={bid}"
+        if not items:
+            if menu_url:
+                await send_text(instance, phone,
+                    f"🍽️ *Room Service Menu*\n━━━━━━━━━━━━━━━━━━\n\n"
+                    f"🏨 Room: *{room}*\n\n👆 Browse here:\n{menu_url}")
+            else:
+                await send_text(instance, phone,
+                    f"🍽️ *Room Service Menu*\n━━━━━━━━━━━━━━━━━━\n\n"
+                    f"Our menu is being prepared — please ask reception for now. 🙏")
+            return
+        # Build a quick text preview (capped to ~10 dishes by category for chat),
+        # but always send the link for full ordering experience.
+        cats: dict = {}
+        for it in items:
+            cats.setdefault(it.get("category", "Other"), []).append(it)
+        preview = ""
+        shown = 0
+        for cat, lst in cats.items():
+            if shown >= 12:
+                preview += "\n_... and more on the link below_\n"
+                break
+            preview += f"\n*{cat}*\n"
+            for it in lst[:4]:
+                if shown >= 12:
+                    break
+                dot = "🔴" if (it.get("type") or "").lower() == "nonveg" else "🟢"
+                star = " ⭐" if it.get("is_bestseller") else ""
+                preview += f"  {dot} {it['name']} — ₹{int(float(it['price'] or 0))}{star}\n"
+                shown += 1
         await send_text(instance, phone,
-            f"🍽️ *Room Service Menu*\n━━━━━━━━━━━━━━━━━━\n\n"
-            f"🏨 Room: *{room}*\n\n👆 Open to browse & order:\n{svc_url}\n\n"
-            f"Orders go straight to our kitchen! 🍳")
+            f"🍽️ *Room Service Menu*\n━━━━━━━━━━━━━━━━━━\n"
+            f"🏨 Room: *{room}*\n{preview}\n"
+            f"━━━━━━━━━━━━━━━━━━\n👆 Tap to order:\n{svc_url}\n\n"
+            f"Orders are added to your room bill 🧾")
         return
 
     # SERVICES
@@ -468,6 +514,7 @@ async def approve_guest(target, staff_phone, hotel, instance, hid, h_name):
         f"🏨 Welcome to *{h_name}*, {name.split()[0]}!\n\n"
         f"🛏️ Room: *{room}*\n📅 Checkout: {fmt_date(co)}\n🔖 {bid}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
+        f"🍽️ Order food: {BASE_URL}/food/{slug}?r={room}&p={target}\n"
         f"🛎️ Services: {BASE_URL}/menu/{slug}?r={room}&p={target}\n"
         f"💰 Bill: {BASE_URL}/bill/{slug}?phone={target}\n\n"
         f"Type *hi* anytime for help! 🙏\n"
