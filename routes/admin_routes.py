@@ -227,9 +227,16 @@ async def all_bookings(request: Request):
         bks = await db.fetch("SELECT b.*,COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Pending'),0) AS balance_due FROM bookings b LEFT JOIN stay_charges sc ON sc.booking_id=b.booking_id GROUP BY b.id ORDER BY b.created_at DESC LIMIT $1", limit)
     return JSONResponse({"bookings": bks})
 
-@router.post("/admin/password")
+@router.post("/password")
 async def change_admin_password(request: Request):
-    """Change the master admin password."""
+    """Change the master admin password.
+
+    Note: this handler is mounted under the `/api/admin` router prefix, so
+    the full URL is `POST /api/admin/password`. The previous version
+    declared `@router.post("/admin/password")` which doubled up the prefix
+    and exposed the endpoint at `/api/admin/admin/password` — every UI
+    that called the documented `/api/admin/password` URL got a 404.
+    """
     user = await require_superadmin(request)
     d = await request.json()
     new_pw = (d.get("new_password") or "").strip()

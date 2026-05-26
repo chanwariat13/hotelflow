@@ -1,7 +1,10 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 *.pyo
+*.log
 .DS_Store
 *.egg-info/
 dist/

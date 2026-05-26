@@ -89,7 +89,7 @@ async def list_pending(slug: str, limit: int = Query(100, ge=1, le=500),
 
 @router.get("/{slug}/all")
 async def list_all(slug: str,
-                   status: Optional[str] = Query(None, regex="^(Pending|Filed|Failed|NotRequired)$"),
+                   status: Optional[str] = Query(None, pattern="^(Pending|Filed|Failed|NotRequired)$"),
                    limit: int = Query(200, ge=1, le=1000),
                    offset: int = Query(0, ge=0)):
     h = await _get_hotel_or_404(slug)
@@ -132,7 +132,7 @@ async def export_single_csv(slug: str, booking_id: str):
 
 @router.get("/{slug}/bulk_csv")
 async def export_bulk_csv(slug: str,
-                          status: str = Query("Pending", regex="^(Pending|Filed|Failed)$"),
+                          status: str = Query("Pending", pattern="^(Pending|Filed|Failed)$"),
                           since_days: int = Query(7, ge=1, le=90)):
     """
     Bulk CSV download of all foreign-guest bookings matching status, useful
