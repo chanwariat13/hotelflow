@@ -1,9 +1,12 @@
+import json
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from services import database as db
 from services.cache import get_session, set_session, set_room, calc_ttl, get_room as cache_get_room
 from services.whatsapp import send_text, send_to_phones
-from services.helpers import booking_id as gen_bk, calc_nights, fmt_date, ist_now, categorize_service, request_id as gen_sr
+from services.helpers import (booking_id as gen_bk, calc_nights, fmt_date, ist_now,
+                              categorize_service, request_id as gen_sr,
+                              html_escape, safe_color, safe_font, safe_url)
 from datetime import date
 import logging
 
@@ -12,28 +15,35 @@ logger = logging.getLogger(__name__)
 
 
 def themed(hotel: dict, title: str, body: str) -> str:
-    pri = hotel.get("primary_color","#c8a84b")
-    sec = hotel.get("secondary_color","#1a2942")
-    bg  = hotel.get("background_color","#0d1117")
-    btn = hotel.get("button_color","#c8a84b")
-    txt = hotel.get("text_color","#ffffff")
-    fnt = hotel.get("font_choice","Outfit")
-    logo= hotel.get("logo_url","")
-    hn  = hotel.get("hotel_name","Hotel")
-    tag = hotel.get("tagline","")
-    addr= hotel.get("address","")
-    city= hotel.get("city","")
-    em  = hotel.get("emergency_number","")
-    maps= hotel.get("google_maps_url","")
-    email=hotel.get("hotel_email","")
-    ci_t= hotel.get("check_in_time","2:00 PM")
-    co_t= hotel.get("checkout_time_display","11:00 AM")
+    # All hotel branding fields are admin-editable. They were previously
+    # interpolated raw, allowing stored XSS / CSS injection from the master
+    # admin into every guest page (`/register/{slug}`, `/menu/{slug}`,
+    # `/bill/{slug}`, `/food/{slug}`). Strict per-field sanitization here
+    # is the choke point — `body` is already HTML composed by the caller
+    # who is responsible for escaping its own dynamic data.
+    pri = safe_color(hotel.get("primary_color"),    "#c8a84b")
+    sec = safe_color(hotel.get("secondary_color"),  "#1a2942")
+    bg  = safe_color(hotel.get("background_color"), "#0d1117")
+    btn = safe_color(hotel.get("button_color"),     "#c8a84b")
+    txt = safe_color(hotel.get("text_color"),       "#ffffff")
+    fnt = safe_font(hotel.get("font_choice"), "Outfit")
+    logo = safe_url(hotel.get("logo_url", ""))
+    hn   = html_escape(hotel.get("hotel_name", "Hotel"))
+    tag  = html_escape(hotel.get("tagline", ""))
+    title_h = html_escape(title)
+    addr = html_escape(hotel.get("address", ""))
+    city = html_escape(hotel.get("city", ""))
+    em   = html_escape(hotel.get("emergency_number", ""))
+    maps = safe_url(hotel.get("google_maps_url", ""))
+    email = html_escape(hotel.get("hotel_email", ""))
+    ci_t = html_escape(hotel.get("check_in_time", "2:00 PM"))
+    co_t = html_escape(hotel.get("checkout_time_display", "11:00 AM"))
     logo_h = f'<img src="{logo}" alt="{hn}" style="height:60px;object-fit:contain;display:block;margin:0 auto 10px">' if logo else ""
-    maps_h = f'<a href="{maps}" target="_blank" style="color:{pri};font-size:12px">📍 Get Directions</a>' if maps else ""
+    maps_h = f'<a href="{maps}" target="_blank" rel="noopener noreferrer" style="color:{pri};font-size:12px">📍 Get Directions</a>' if maps else ""
     return f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0">
-<title>{title} — {hn}</title>
+<title>{title_h} — {hn}</title>
 <link href="https://fonts.googleapis.com/css2?family={fnt.replace(' ','+')}:wght@300;400;500;600&family=Playfair+Display:wght@600&display=swap" rel="stylesheet">
 <style>
 :root{{--p:{pri};--s:{sec};--bg:{bg};--btn:{btn};--t:{txt};}}
@@ -85,11 +95,15 @@ async def reg_page(slug: str, request: Request):
     for r in rooms:
         occ = await cache_get_room(r["room_number"])
         if not occ:
-            room_opts += f'<option value="{r["room_number"]}" data-secret="{r["qr_secret"]}" data-rate="{r["room_rate"] or 0}">{r["room_number"]} — {r["room_type"]} (₹{r["room_rate"] or 0}/night)</option>'
+            rn  = html_escape(r["room_number"])
+            rt  = html_escape(r.get("room_type", ""))
+            rs  = html_escape(r.get("qr_secret", "") or "")
+            rr  = float(r.get("room_rate") or 0)
+            room_opts += f'<option value="{rn}" data-secret="{rs}" data-rate="{rr}">{rn} — {rt} (₹{rr:.0f}/night)</option>'
 
     body = f"""
 <div class="card"><div class="ct">🏨 Guest Registration</div>
-  <p style="font-size:13px;opacity:.65">{hotel.get("welcome_message","Welcome! Please fill your details.")}</p>
+  <p style="font-size:13px;opacity:.65">{html_escape(hotel.get("welcome_message","Welcome! Please fill your details."))}</p>
 </div>
 <div class="card"><div class="ct">🛏️ Room & Dates</div>
   <label>Select Room *</label>
@@ -126,7 +140,7 @@ async def reg_page(slug: str, request: Request):
 <div id="extraGuests"></div>
 <button class="btn" id="subBtn" onclick="submit()">✅ Complete Registration</button>
 <script>
-const CLOUD="{hotel.get('cloudinary_cloud_name','')}",PRESET="{hotel.get('cloudinary_upload_preset','')}",SLUG="{slug}";
+const CLOUD={json.dumps(hotel.get('cloudinary_cloud_name','') or '')},PRESET={json.dumps(hotel.get('cloudinary_upload_preset','') or '')},SLUG={json.dumps(slug)};
 
 function onRoom(){{
   const o=document.getElementById('roomSel').selectedOptions[0];
@@ -233,7 +247,7 @@ document.getElementById('gPhone').addEventListener('input', function(){{
   _luTimer=setTimeout(async()=>{{
     _luLast=p;
     try{{
-      const r=await fetch('/api/guest/lookup?slug={slug}&phone='+encodeURIComponent(p));
+      const r=await fetch('/api/guest/lookup?slug='+encodeURIComponent(SLUG)+'&phone='+encodeURIComponent(p));
       const d=await r.json();
       const wb=document.getElementById('welcomeBack');
       const ni=document.getElementById('gName');
@@ -262,7 +276,7 @@ async def menu_page(slug: str, request: Request):
     if not hotel: raise HTTPException(404)
     hid = hotel["id"]
     services = await db.get_services(hid)
-    pri = hotel.get("primary_color","#c8a84b")
+    pri = safe_color(hotel.get("primary_color"), "#c8a84b")
 
     cats: dict = {}
     for s in services:
@@ -270,15 +284,20 @@ async def menu_page(slug: str, request: Request):
 
     svc_html = ""
     for cat, items in cats.items():
-        svc_html += f'<div class="ctitle">🔹 {cat}</div>'
+        cat_html = html_escape(cat)
+        svc_html += f'<div class="ctitle">🔹 {cat_html}</div>'
         for s in items:
             p = float(s.get("price",0))
             ps = f"₹{p:.0f}" if p>0 else "Free"
-            desc = s.get("description","") or ""
-            sname = s['service_name']
-            sname_js = sname.replace("\\", "\\\\").replace("'", "\\'")
+            sname_raw = s.get("service_name", "")
+            sname = html_escape(sname_raw)
+            desc = html_escape(s.get("description","") or "")
+            # JSON-encode the name for use inside the onclick handler so a
+            # service named  Foo'); evil(); //  cannot break out of the
+            # function call.
+            sname_js = json.dumps(sname_raw)
             desc_html = f'<div style="font-size:11px;opacity:.55;margin-top:2px">{desc}</div>' if desc else ''
-            svc_html += f"""<div class="scard" onclick="reqSvc('{sname_js}',{p})">
+            svc_html += f"""<div class="scard" onclick="reqSvc({sname_js},{p})">
               <div style="display:flex;justify-content:space-between;align-items:center">
                 <div><b style="font-size:14px">{sname}</b>{desc_html}</div>
                 <span style="font-weight:600;color:{pri};white-space:nowrap;margin-left:10px">{ps}</span>
@@ -297,7 +316,7 @@ async def menu_page(slug: str, request: Request):
 <div id="svcDiv" style="display:none">
   <div class="card">
     <div class="ct">🛎️ Available Services</div>
-    <div style="font-size:12px;opacity:.55;margin-bottom:12px">⏰ Hours: {hotel.get('svc_open_hour',7)}AM – {hotel.get('svc_close_hour',23)}PM · Checkout: {hotel.get('checkout_time_display','11:00 AM')}</div>
+    <div style="font-size:12px;opacity:.55;margin-bottom:12px">⏰ Hours: {int(hotel.get('svc_open_hour',7) or 7)}AM – {int(hotel.get('svc_close_hour',23) or 23)}PM · Checkout: {html_escape(hotel.get('checkout_time_display','11:00 AM'))}</div>
     {svc_html or '<p style="opacity:.5;text-align:center;padding:16px">No services available.</p>'}
   </div>
 </div>
@@ -342,7 +361,7 @@ async function reqSvc(svc,price){{
   if(!gRoom||!gPhone){{showToast('Confirm your room first',false);return;}}
   if(price>0&&!confirm(svc+'\\n₹'+price+' will be added to your bill. Confirm?'))return;
   const r=await fetch('/api/guest/service',{{method:'POST',headers:{{'Content-Type':'application/json'}},
-    body:JSON.stringify({{slug:'{slug}',room:gRoom,phone:gPhone,booking_id:gBid,service:svc}})}});
+    body:JSON.stringify({{slug:{json.dumps(slug)},room:gRoom,phone:gPhone,booking_id:gBid,service:svc}})}});
   const d=await r.json();
   if(d.success){{showToast('✅ Request sent! Our team will attend shortly.');loadBill();}}
   else showToast('Error: '+(d.error||'Try again'),false);
@@ -359,7 +378,7 @@ if(p.get('p')){{document.getElementById('phoneInp').value=p.get('p');if(p.get('r
 async def bill_page(slug: str, request: Request):
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel: raise HTTPException(404)
-    pri = hotel.get("primary_color","#c8a84b")
+    pri = safe_color(hotel.get("primary_color"), "#c8a84b")
     body = f"""
 <div class="card"><div class="ct">💰 View Your Bill</div>
   <label>Your WhatsApp Number</label>
@@ -371,7 +390,7 @@ async def bill_page(slug: str, request: Request):
 async function loadBill(){{
   const phone=document.getElementById('bPhone').value.trim();
   if(!phone){{showToast('Enter your phone number',false);return;}}
-  const r=await fetch('/api/guest/bill?phone='+phone+'&slug={slug}');
+  const r=await fetch('/api/guest/bill?phone='+encodeURIComponent(phone)+'&slug='+encodeURIComponent({json.dumps(slug)}));
   const d=await r.json();
   if(!d.found){{showToast('No active booking found',false);return;}}
   let h=`<div class="card"><div class="ct">🔖 Booking Details</div>
@@ -624,7 +643,7 @@ async def food_page(slug: str, request: Request):
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel:
         raise HTTPException(404)
-    pri = hotel.get("primary_color", "#c8a84b")
+    pri = safe_color(hotel.get("primary_color"), "#c8a84b")
     body = f"""
 <div class="card" id="initCard">
   <div class="ct">🍽️ Order Food to Your Room</div>
@@ -673,7 +692,7 @@ async def food_page(slug: str, request: Request):
 <div id="myOrders" style="display:none;margin-top:16px"></div>
 
 <script>
-const SLUG='{slug}';
+const SLUG={json.dumps(slug)};
 let MENU=[],CATS=[],activeCat='All',gRoom='',gPhone='',gName='',gBid='';
 let cart={{}};
 

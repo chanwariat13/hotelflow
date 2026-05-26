@@ -426,6 +426,11 @@ async def _handle_razorpay_event(hotel: dict, body: dict):
     Process an authenticated Razorpay event in the background.
     Currently handles `payment_link.paid` — marks the matching booking's
     pending charges paid and notifies guest + staff.
+
+    Idempotent. Razorpay retries the same event for up to 24h on any
+    non-2xx/timeout; without the `claim_event` short-circuit below, each
+    retry would double-mark charges paid, double-bump `total_paid`, and
+    insert duplicate `payment_log` rows.
     """
     try:
         event = body.get("event", "")
@@ -440,6 +445,19 @@ async def _handle_razorpay_event(hotel: dict, body: dict):
         phone = (link.get("customer") or {}).get("contact") or notes.get("phone", "")
         amount = float(payment.get("amount", 0)) / 100.0
         ref = payment.get("id") or link.get("id") or ""
+
+        # Idempotency: claim the unique payment id (or the payment-link id
+        # as fallback) for THIS hotel before doing any side effects. The
+        # scope is per-hotel so the same provider id can't accidentally
+        # block another tenant's matching event id.
+        from services.cache import claim_event as _claim_event
+        event_uid = payment.get("id") or link.get("id") or body.get("id") or ""
+        if not await _claim_event(f"razorpay:{hotel['id']}", str(event_uid)):
+            logger.info(
+                "razorpay event already processed; skipping. hotel_id=%s event_id=%s",
+                hotel["id"], event_uid,
+            )
+            return
 
         if not bid:
             # Try to find the active booking from room_number / phone

