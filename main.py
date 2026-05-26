@@ -39,6 +39,35 @@ if not SECRET_KEY or SECRET_KEY == "changeme":
         "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
     )
 
+# ── Refuse to start without a WhatsApp webhook key ───────────────────────────
+# routes/bot.py historically logged-and-allowed when WEBHOOK_API_KEY was
+# unset. Anyone who learnt the public webhook URL could then POST a forged
+# `messages.upsert` payload from a phone matching a staff `whatsapp_number`
+# and drive APPROVE / REJECT / CASH RECEIVED / FREE / CHECKOUT / BLOCK from
+# the outside. We now require a key at boot, matching the SECRET_KEY guard
+# above. Operators who haven't yet configured Evolution to send the
+# matching `apikey` header can opt OUT explicitly by setting
+# `WEBHOOK_AUTH_OPTOUT=1` (intended ONLY for short migrations; the bot
+# still logs a WARNING on every accepted hit).
+_WEBHOOK_KEY_SETTING = (
+    os.getenv("WEBHOOK_API_KEY") or os.getenv("EVOLUTION_API_KEY") or ""
+).strip()
+_WEBHOOK_OPTOUT = (os.getenv("WEBHOOK_AUTH_OPTOUT") or "").strip() in {"1", "true", "yes"}
+if not _WEBHOOK_KEY_SETTING and not _WEBHOOK_OPTOUT:
+    logger.critical(
+        "WEBHOOK_API_KEY (or EVOLUTION_API_KEY) is not set. The WhatsApp "
+        "inbound webhook would otherwise accept forged messages.upsert "
+        "payloads from anyone. Refusing to start. Configure Evolution API "
+        "to send a shared `apikey` header, set WEBHOOK_API_KEY to the "
+        "matching value, and restart. For a short migration window only, "
+        "set WEBHOOK_AUTH_OPTOUT=1."
+    )
+    raise SystemExit(
+        "WEBHOOK_API_KEY (or EVOLUTION_API_KEY) must be set, or "
+        "WEBHOOK_AUTH_OPTOUT=1 for a short migration window, before "
+        "starting HotelFlow."
+    )
+
 FRONTEND = os.path.join(os.path.dirname(__file__), "frontend")
 
 
