@@ -431,6 +431,26 @@ async def api_register(request: Request):
     idp   = str(body.get("id_proof_photo","")).strip()
     idb   = str(body.get("id_proof_photo_back","")).strip()
     gstin = str(body.get("customer_gstin","")).strip().upper()
+    # Foreign-guest fields (Form C / FRRO). All optional; only the foreign flag
+    # plus passport/visa fields trigger the FormC-pending workflow.
+    is_foreign = bool(body.get("is_foreign_guest", False))
+    nationality = str(body.get("nationality","")).strip()
+    sex = str(body.get("sex","")).strip()
+    dob = str(body.get("date_of_birth","")).strip()
+    passport_no = str(body.get("passport_no","")).strip().upper()
+    passport_place = str(body.get("passport_place_of_issue","")).strip()
+    passport_issue = str(body.get("passport_issue_date","")).strip()
+    passport_expiry = str(body.get("passport_expiry_date","")).strip()
+    visa_no = str(body.get("visa_no","")).strip().upper()
+    visa_type = str(body.get("visa_type","")).strip()
+    visa_place = str(body.get("visa_issue_place","")).strip()
+    visa_issue = str(body.get("visa_issue_date","")).strip()
+    visa_expiry = str(body.get("visa_expiry_date","")).strip()
+    arrival_date = str(body.get("arrival_in_india_date","")).strip()
+    arrival_port = str(body.get("arrival_in_india_port","")).strip()
+    last_country = str(body.get("last_country_visited","")).strip()
+    next_dest = str(body.get("next_destination","")).strip()
+    purpose = str(body.get("purpose_of_visit","")).strip()
     if not all([room,phone,name,ci,co]):
         return JSONResponse({"success":False,"error":"Missing required fields"},400)
     room_row = await db.get_room(room, hid)
@@ -456,7 +476,16 @@ async def api_register(request: Request):
         "guest_phone":phone,"checkin_date":ci,"checkout_date":co,
         "payment_mode":"Pay at checkout","id_proof_type":idt,"id_proof_number":idn,
         "id_proof_photo":idp,"id_proof_photo_back":idb,"guest_count":count,
-        "alternate_phone":alt,"hotel_id":hid,"customer_gstin":gstin})
+        "alternate_phone":alt,"hotel_id":hid,"customer_gstin":gstin,
+        "is_foreign_guest":is_foreign,"nationality":nationality,
+        "sex":sex,"date_of_birth":dob,
+        "passport_no":passport_no,"passport_place_of_issue":passport_place,
+        "passport_issue_date":passport_issue,"passport_expiry_date":passport_expiry,
+        "visa_no":visa_no,"visa_type":visa_type,"visa_issue_place":visa_place,
+        "visa_issue_date":visa_issue,"visa_expiry_date":visa_expiry,
+        "arrival_in_india_date":arrival_date,"arrival_in_india_port":arrival_port,
+        "last_country_visited":last_country,"next_destination":next_dest,
+        "purpose_of_visit":purpose})
     if extra: await db.insert_additional_guests(bk_id, extra, hid)
     if rate > 0:
         await db.insert_stay_charge({"booking_id":bk_id,"charge_date":date.today(),
