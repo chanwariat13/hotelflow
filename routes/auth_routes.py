@@ -52,9 +52,25 @@ async def hotel_login(slug: str, request: Request):
     if not hotel:
         return JSONResponse({"success": False, "error": "Hotel not found"}, status_code=404)
     body = await request.json()
-    user = await db.verify_hotel_user_login(hotel["id"], body.get("username", ""), body.get("password", ""))
+    username = body.get("username", "")
+    password = body.get("password", "")
+    # Optional role from the new login dropdown. When supplied, we verify the
+    # user actually has that role so a staff account can't accidentally pick
+    # "Owner" on the form. When absent (older clients), we fall back to the
+    # original username+password check.
+    expected_role = (body.get("role") or "").strip().lower()
+
+    user = await db.verify_hotel_user_login(hotel["id"], username, password)
     if not user:
         return JSONResponse({"success": False, "error": "Invalid credentials"}, status_code=401)
+
+    if expected_role and (user.get("role") or "").lower() != expected_role:
+        # Don't leak which field was wrong — keep the message generic-ish but
+        # actionable so the operator picks the right role next time.
+        return JSONResponse(
+            {"success": False, "error": f"This account is not a {expected_role}. Pick the correct role."},
+            status_code=401,
+        )
 
     # Include all permissions in the token payload.
     extra = {k: v for k, v in user.items() if k.startswith("can_")}
