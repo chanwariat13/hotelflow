@@ -64,19 +64,24 @@ def _mask(account: Optional[dict]) -> Optional[dict]:
 hotel_router = APIRouter(prefix="/api/hotel")
 
 
-async def _hotel(slug: str, request: Request, perm: str = "can_edit_hotel") -> dict:
-    """Authorize and resolve the hotel row from slug."""
-    await require_perm(request, slug, perm)
+async def _hotel(slug: str, request: Request, perm: str = "can_edit_hotel"):
+    """
+    Authorize the caller, resolve the hotel row from slug, and hand back
+    both so handlers don't have to re-call require_perm just to capture
+    the user object for the audit log.
+    Returns (hotel: dict, user: dict).
+    """
+    user = await require_perm(request, slug, perm)
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel:
         raise HTTPException(404, "Hotel not found")
-    return hotel
+    return hotel, user
 
 
 # ── Account ───────────────────────────────────────────────────────
 @hotel_router.get("/{slug}/channel/account")
 async def get_account(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     account = await db.get_channel_account(hotel["id"])
     return JSONResponse({"account": _mask(account)})
 
@@ -88,8 +93,7 @@ async def connect_account(slug: str, request: Request):
     with the new values. Empty/missing secret fields preserve the
     existing values rather than wiping them.
     """
-    hotel = await _hotel(slug, request)
-    user = await require_perm(request, slug, "can_edit_hotel")
+    hotel, user = await _hotel(slug, request)
     data = await request.json()
     provider = (data.get("provider") or "").lower().strip()
     if provider not in cm.ADAPTERS:
@@ -111,8 +115,7 @@ async def connect_account(slug: str, request: Request):
 
 @hotel_router.delete("/{slug}/channel/disconnect")
 async def disconnect_account(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
-    user = await require_perm(request, slug, "can_edit_hotel")
+    hotel, user = await _hotel(slug, request)
     await db.disconnect_channel_account(hotel["id"])
     await audit("channel.disconnect",
                 actor=_actor(user), actor_role="owner",
@@ -126,13 +129,13 @@ async def disconnect_account(slug: str, request: Request):
 # ── Room types & rate plans ───────────────────────────────────────
 @hotel_router.get("/{slug}/channel/room-types")
 async def list_room_types(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     return JSONResponse({"room_types": await db.list_channel_room_types(hotel["id"])})
 
 
 @hotel_router.post("/{slug}/channel/room-types")
 async def upsert_room_type(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     data = await request.json()
     if not (data.get("provider_code") or "").strip():
         raise HTTPException(400, "provider_code is required")
@@ -144,20 +147,20 @@ async def upsert_room_type(slug: str, request: Request):
 
 @hotel_router.delete("/{slug}/channel/room-types/{rt_id}")
 async def delete_room_type(slug: str, rt_id: int, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     await db.delete_channel_room_type(hotel["id"], rt_id)
     return JSONResponse({"success": True})
 
 
 @hotel_router.get("/{slug}/channel/rate-plans")
 async def list_rate_plans(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     return JSONResponse({"rate_plans": await db.list_channel_rate_plans(hotel["id"])})
 
 
 @hotel_router.post("/{slug}/channel/rate-plans")
 async def upsert_rate_plan(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     data = await request.json()
     if not (data.get("code") or "").strip():
         raise HTTPException(400, "code is required (e.g. BAR, NRR)")
@@ -169,7 +172,7 @@ async def upsert_rate_plan(slug: str, request: Request):
 
 @hotel_router.delete("/{slug}/channel/rate-plans/{rp_id}")
 async def delete_rate_plan(slug: str, rp_id: int, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     await db.delete_channel_rate_plan(hotel["id"], rp_id)
     return JSONResponse({"success": True})
 
@@ -182,7 +185,7 @@ async def preview_inventory(slug: str, request: Request):
     (defaults to 30). Useful for the dashboard so the operator sees
     exactly what we'd push to OTAs *before* clicking sync.
     """
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     try:
         days = int(request.query_params.get("days", "30"))
     except ValueError:
@@ -193,8 +196,7 @@ async def preview_inventory(slug: str, request: Request):
 
 @hotel_router.post("/{slug}/channel/sync/inventory")
 async def manual_push_inventory(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
-    user = await require_perm(request, slug, "can_edit_hotel")
+    hotel, user = await _hotel(slug, request)
     body = {}
     try:
         body = await request.json()
@@ -211,8 +213,7 @@ async def manual_push_inventory(slug: str, request: Request):
 
 @hotel_router.post("/{slug}/channel/sync/bookings")
 async def manual_pull_bookings(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
-    user = await require_perm(request, slug, "can_edit_hotel")
+    hotel, user = await _hotel(slug, request)
     result = await cm.pull_bookings_for_hotel(hotel["id"])
     await audit("channel.sync.bookings",
                 actor=_actor(user), actor_role="owner",
@@ -224,7 +225,7 @@ async def manual_pull_bookings(slug: str, request: Request):
 # ── Sync log ──────────────────────────────────────────────────────
 @hotel_router.get("/{slug}/channel/sync-log")
 async def get_sync_log(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     try:
         limit = int(request.query_params.get("limit", "100"))
     except ValueError:
@@ -235,7 +236,7 @@ async def get_sync_log(slug: str, request: Request):
 # ── OTA bookings ──────────────────────────────────────────────────
 @hotel_router.get("/{slug}/channel/bookings")
 async def list_ota_bookings(slug: str, request: Request):
-    hotel = await _hotel(slug, request)
+    hotel, _user = await _hotel(slug, request)
     status = request.query_params.get("status") or None
     try:
         limit = int(request.query_params.get("limit", "200"))
@@ -251,10 +252,10 @@ async def ingest_ota_booking(slug: str, cb_id: int, request: Request):
     """
     Convert an OTA reservation into a real booking. Operator picks a
     room. We block the action if the room is occupied for overlapping
-    dates so we can never double-book.
+    dates so we can never double-book. Ingest is gated on
+    can_approve_checkin since it's effectively a check-in.
     """
-    hotel = await _hotel(slug, request)
-    user = await require_perm(request, slug, "can_approve_checkin")
+    hotel, user = await _hotel(slug, request, perm="can_approve_checkin")
     data = {}
     try:
         data = await request.json()
