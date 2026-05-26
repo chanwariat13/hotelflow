@@ -214,7 +214,6 @@ SELECT 'IMPORTANT: Change admin password at /admin after first login!' AS warnin
 
 
 
-
 -- ── 8. Night audit + KPI reports ─────────────────────────────────
 -- One row per (hotel_id, audit_date). Auto-populated by the nightly
 -- scheduler; can also be back-filled manually from the dashboard.
@@ -257,3 +256,134 @@ CREATE TABLE IF NOT EXISTS night_audits (
     UNIQUE(hotel_id, audit_date)
 );
 CREATE INDEX IF NOT EXISTS idx_night_audits_hotel_date ON night_audits(hotel_id, audit_date DESC);
+
+-- ════════════════════════════════════════════════════════════════
+-- Channel Manager (OTA aggregator) integration
+-- One adapter integration here = MMT + Goibibo + Booking.com + Agoda
+-- + Expedia + 50 more, because the aggregator already speaks to all
+-- of them. Provider is per-hotel (axisrooms / staah / rategain / ...).
+-- ════════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS channel_accounts (
+    id              SERIAL PRIMARY KEY,
+    hotel_id        INTEGER      NOT NULL UNIQUE,
+    provider        VARCHAR(40)  NOT NULL DEFAULT 'axisrooms',
+    base_url        VARCHAR(300) DEFAULT '',
+    hotel_code      VARCHAR(80)  DEFAULT '',
+    api_key         VARCHAR(300) DEFAULT '',
+    api_secret      VARCHAR(300) DEFAULT '',
+    username        VARCHAR(120) DEFAULT '',
+    password        VARCHAR(300) DEFAULT '',
+    webhook_secret  VARCHAR(200) DEFAULT '',
+    push_inventory_minutes INTEGER DEFAULT 30,
+    pull_bookings_minutes  INTEGER DEFAULT 15,
+    inventory_horizon_days INTEGER DEFAULT 60,
+    dry_run         BOOLEAN      DEFAULT TRUE,
+    is_active       BOOLEAN      DEFAULT FALSE,
+    last_inventory_push_at TIMESTAMP,
+    last_booking_pull_at   TIMESTAMP,
+    last_error      TEXT         DEFAULT '',
+    created_at      TIMESTAMP    DEFAULT NOW(),
+    updated_at      TIMESTAMP    DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_channel_accounts_hotel ON channel_accounts(hotel_id);
+
+CREATE TABLE IF NOT EXISTS channel_room_types (
+    id                  SERIAL PRIMARY KEY,
+    hotel_id            INTEGER      NOT NULL,
+    room_type           VARCHAR(80)  NOT NULL,
+    provider_code       VARCHAR(80)  NOT NULL,
+    provider_label      VARCHAR(150) DEFAULT '',
+    total_units         INTEGER      DEFAULT 0,
+    base_rate           NUMERIC(10,2) DEFAULT 0,
+    is_active           BOOLEAN      DEFAULT TRUE,
+    created_at          TIMESTAMP    DEFAULT NOW(),
+    updated_at          TIMESTAMP    DEFAULT NOW(),
+    UNIQUE(hotel_id, provider_code)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_room_types_hotel ON channel_room_types(hotel_id);
+
+CREATE TABLE IF NOT EXISTS channel_rate_plans (
+    id              SERIAL PRIMARY KEY,
+    hotel_id        INTEGER      NOT NULL,
+    room_type_id    INTEGER      NOT NULL,
+    code            VARCHAR(40)  NOT NULL,
+    name            VARCHAR(150) DEFAULT '',
+    meal_plan       VARCHAR(20)  DEFAULT 'EP',
+    rate_modifier   NUMERIC(6,3) DEFAULT 1.000,
+    is_default      BOOLEAN      DEFAULT FALSE,
+    is_active       BOOLEAN      DEFAULT TRUE,
+    created_at      TIMESTAMP    DEFAULT NOW(),
+    updated_at      TIMESTAMP    DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_channel_rate_plans_hotel ON channel_rate_plans(hotel_id);
+CREATE INDEX IF NOT EXISTS idx_channel_rate_plans_rt    ON channel_rate_plans(room_type_id);
+
+CREATE TABLE IF NOT EXISTS channel_inventory (
+    id              SERIAL PRIMARY KEY,
+    hotel_id        INTEGER      NOT NULL,
+    room_type_id    INTEGER      NOT NULL,
+    stay_date       DATE         NOT NULL,
+    available_units INTEGER      DEFAULT 0,
+    base_rate       NUMERIC(10,2) DEFAULT 0,
+    stop_sell       BOOLEAN      DEFAULT FALSE,
+    last_pushed_at  TIMESTAMP,
+    last_push_status VARCHAR(20) DEFAULT 'pending',
+    created_at      TIMESTAMP    DEFAULT NOW(),
+    updated_at      TIMESTAMP    DEFAULT NOW(),
+    UNIQUE(hotel_id, room_type_id, stay_date)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_inv_hotel_date ON channel_inventory(hotel_id, stay_date);
+
+CREATE TABLE IF NOT EXISTS channel_sync_log (
+    id              SERIAL PRIMARY KEY,
+    hotel_id        INTEGER      NOT NULL,
+    provider        VARCHAR(40)  DEFAULT '',
+    operation       VARCHAR(40)  NOT NULL,
+    status          VARCHAR(20)  DEFAULT 'ok',
+    records         INTEGER      DEFAULT 0,
+    duration_ms     INTEGER      DEFAULT 0,
+    error           TEXT         DEFAULT '',
+    payload_summary TEXT         DEFAULT '',
+    created_at      TIMESTAMP    DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_channel_sync_log_hotel ON channel_sync_log(hotel_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS channel_bookings (
+    id                  SERIAL PRIMARY KEY,
+    hotel_id            INTEGER      NOT NULL,
+    provider            VARCHAR(40)  DEFAULT '',
+    provider_ref        VARCHAR(120) NOT NULL,
+    ota_source          VARCHAR(60)  DEFAULT '',
+    ota_booking_id      VARCHAR(120) DEFAULT '',
+    guest_name          VARCHAR(200) DEFAULT '',
+    guest_email         VARCHAR(200) DEFAULT '',
+    guest_phone         VARCHAR(40)  DEFAULT '',
+    guest_country       VARCHAR(80)  DEFAULT '',
+    checkin_date        DATE,
+    checkout_date       DATE,
+    nights              INTEGER      DEFAULT 0,
+    guests              INTEGER      DEFAULT 1,
+    room_type_code      VARCHAR(80)  DEFAULT '',
+    rate_plan_code      VARCHAR(40)  DEFAULT '',
+    room_count          INTEGER      DEFAULT 1,
+    currency            VARCHAR(8)   DEFAULT 'INR',
+    total_amount        NUMERIC(12,2) DEFAULT 0,
+    ota_commission      NUMERIC(12,2) DEFAULT 0,
+    payment_terms       VARCHAR(40)  DEFAULT 'pay_at_hotel',
+    status              VARCHAR(20)  DEFAULT 'new',
+    special_requests    TEXT         DEFAULT '',
+    raw_payload         TEXT         DEFAULT '',
+    mapped_booking_id   VARCHAR(40)  DEFAULT '',
+    received_at         TIMESTAMP    DEFAULT NOW(),
+    ingested_at         TIMESTAMP,
+    cancelled_at        TIMESTAMP,
+    created_at          TIMESTAMP    DEFAULT NOW(),
+    updated_at          TIMESTAMP    DEFAULT NOW(),
+    UNIQUE(hotel_id, provider, provider_ref)
+);
+CREATE INDEX IF NOT EXISTS idx_channel_bookings_hotel ON channel_bookings(hotel_id, status);
+CREATE INDEX IF NOT EXISTS idx_channel_bookings_dates ON channel_bookings(hotel_id, checkin_date);
+CREATE INDEX IF NOT EXISTS idx_channel_bookings_phone ON channel_bookings(guest_phone);
+
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ota_source  VARCHAR(60)  DEFAULT '';
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS channel_ref VARCHAR(120) DEFAULT '';

@@ -215,3 +215,27 @@ async def job_night_audit():
             logger.info("night_audit ran: %s", results)
     except Exception as e:
         logger.error(f"night_audit error: {e}")
+
+
+# ── Channel Manager (OTA aggregator) ──────────────────────────────
+# We push our inventory snapshot to the configured aggregator on a
+# fixed cadence and pull new reservations slightly more often so OTA
+# bookings show up in the dashboard within minutes.
+async def job_channel_push_inventory():
+    try:
+        from services.channel_manager import run_all_active_hotels
+        results = await run_all_active_hotels("push_inventory")
+        if results:
+            logger.info("channel.push_inventory ran: %s", results)
+    except Exception as e:
+        logger.error(f"channel push_inventory error: {e}")
+
+
+async def job_channel_pull_bookings():
+    try:
+        from services.channel_manager import run_all_active_hotels
+        results = await run_all_active_hotels("pull_bookings")
+        if results:
+            logger.info("channel.pull_bookings ran: %s", results)
+    except Exception as e:
+        logger.error(f"channel pull_bookings error: {e}")

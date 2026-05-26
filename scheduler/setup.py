@@ -2,7 +2,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from scheduler.jobs import (job_daily_report, job_monthly_report,
     job_reminder_1, job_reminder_2, job_late_alert,
-    job_auto_late_charge, job_auto_cleanup, job_night_audit)
+    job_auto_late_charge, job_auto_cleanup, job_night_audit,
+    job_channel_push_inventory, job_channel_pull_bookings)
 from services.database import get_all_hotels
 import logging
 
@@ -14,6 +15,19 @@ async def start_scheduler():
     # Cleanup every 30 min — always
     scheduler.add_job(job_auto_cleanup, CronTrigger(minute="*/30", timezone="Asia/Kolkata"),
                       id="auto_cleanup", replace_existing=True)
+
+    # Channel manager (OTA aggregator) — global jobs that walk every
+    # hotel with an active channel account. We keep two cadences:
+    #   - inventory push every 30 min (rates + availability fanout)
+    #   - booking pull every 15 min  (OTA reservations into dashboard)
+    # Per-hotel push/pull intervals on channel_accounts are honoured
+    # implicitly because run_all_active_hotels skips inactive accounts.
+    scheduler.add_job(job_channel_push_inventory,
+                      CronTrigger(minute="*/30", timezone="Asia/Kolkata"),
+                      id="channel_push_inventory", replace_existing=True)
+    scheduler.add_job(job_channel_pull_bookings,
+                      CronTrigger(minute="*/15", timezone="Asia/Kolkata"),
+                      id="channel_pull_bookings", replace_existing=True)
 
     hotels = await get_all_hotels()
     for h in hotels:
