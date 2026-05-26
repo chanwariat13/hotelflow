@@ -47,7 +47,15 @@ body{font-family:'Outfit',sans-serif;background:#0d1117;color:#e6edf3;min-height
   <!-- Hotel Login -->
   <div id="hotelForm" style="display:none">
     <div class="fg"><label>Hotel Slug</label><input type="text" id="hSlug" placeholder="grand-stay"></div>
-    <div class="fg"><label>Username</label><input type="text" id="hUser" placeholder="owner / manager / staff_name"></div>
+    <div class="fg">
+      <label>Login as</label>
+      <select id="hRole" onchange="updateUserPlaceholder()">
+        <option value="owner">🏨 Owner</option>
+        <option value="manager">👔 Manager</option>
+        <option value="staff">👤 Staff</option>
+      </select>
+    </div>
+    <div class="fg"><label>Username</label><input type="text" id="hUser" placeholder="owner_username"></div>
     <div class="fg"><label>Password</label><input type="password" id="hPass" placeholder="••••••••" onkeydown="if(event.key==='Enter')hotelLogin()"></div>
     <button class="btn" onclick="hotelLogin()" id="hBtn">Login to Dashboard</button>
     <div class="err" id="hErr"></div>
@@ -77,17 +85,28 @@ async function adminLogin(){
 }
 async function hotelLogin(){
   const slug=document.getElementById('hSlug').value.trim().toLowerCase();
+  const role=document.getElementById('hRole').value;
   const u=document.getElementById('hUser').value.trim();
   const p=document.getElementById('hPass').value;
   const btn=document.getElementById('hBtn');const err=document.getElementById('hErr');
-  if(!slug||!u||!p){err.style.display='block';err.textContent='Fill all fields';return;}
+  if(!slug||!role||!u||!p){err.style.display='block';err.textContent='Fill all fields';return;}
   btn.disabled=true;btn.textContent='Logging in...';err.style.display='none';
   try{
-    const r=await fetch(`/auth/hotel/${slug}/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    const r=await fetch(`/auth/hotel/${slug}/login`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p,role:role})});
     const d=await r.json();
     if(d.success){window.location.href=`/hotel/${slug}`;}
     else{err.style.display='block';err.textContent=d.error||'Invalid credentials';btn.disabled=false;btn.textContent='Login to Dashboard';}
   }catch(e){err.style.display='block';err.textContent='Network error';btn.disabled=false;btn.textContent='Login to Dashboard';}
+}
+// Update the username placeholder so the user knows what to type for the
+// role they just picked. Purely cosmetic; backend still authenticates by
+// (slug, username, password) and validates the role separately.
+function updateUserPlaceholder(){
+  const role=document.getElementById('hRole').value;
+  const inp=document.getElementById('hUser');
+  inp.placeholder = role==='owner'   ? 'owner_username'
+                  : role==='manager' ? 'manager_username'
+                  :                    'staff_username';
 }
 // Pre-fill slug from URL
 const sp=new URLSearchParams(window.location.search);
