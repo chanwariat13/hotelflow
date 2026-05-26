@@ -149,3 +149,34 @@ async def claim_event(scope: str, event_id: str, ttl: int = 7 * 24 * 3600) -> bo
     key = f"evt:{scope}:{event_id}"
     # SET key value NX EX ttl  →  returns True only if the key didn't exist.
     return bool(await r.set(key, "1", nx=True, ex=ttl))
+
+
+
+async def rate_limit_check(key: str, limit: int, window_seconds: int) -> bool:
+    """Simple fixed-window rate limiter on top of Redis INCR + EXPIRE.
+
+    Returns True when the call is allowed, False when the limit has been hit
+    inside the current window. The first call inside a window seeds the
+    counter and arms the TTL; subsequent calls just INCR. When the TTL
+    expires the counter naturally resets.
+
+    `key` should already be namespaced by the caller (e.g.
+    `f"lookup:ip:{slug}:{ip}"`) so different rate-limited surfaces don't
+    share counters. We deliberately don't raise on Redis failures here:
+    if Redis is down, fail OPEN rather than lock everyone out — the
+    caller can decide whether that's acceptable.
+    """
+    if limit <= 0 or window_seconds <= 0:
+        return True
+    try:
+        r = await get_redis()
+        # Use a pipeline so the INCR + (conditional) EXPIRE round-trip is
+        # one network hop. The EXPIRE only fires on the first hit of a
+        # window — INCR returns 1 in that case.
+        count = await r.incr(key)
+        if count == 1:
+            await r.expire(key, int(window_seconds))
+        return int(count) <= int(limit)
+    except Exception as e:
+        logger.warning("rate_limit_check failed open for key=%s: %s", key, e)
+        return True

@@ -348,9 +348,15 @@ async def handle_guest(phone, text, UP, session, hotel, instance, hid, h_name,
 
     # HI / HELLO / HELP / MENU
     if UP in ("HI","HELLO","HEY","START","HELP","MENU","HOME"):
-        food_url = f"{BASE_URL}/food/{slug}?r={room}&p={phone}"
-        svc_url  = f"{BASE_URL}/menu/{slug}?r={room}&p={phone}"
-        bill_url = f"{BASE_URL}/bill/{slug}?phone={phone}"
+        # Append the per-guest session token so the linked pages can prove
+        # to /api/guest/bill, /api/guest/charges, /api/guest/food/my-orders
+        # that the request is from this guest's WhatsApp flow rather than
+        # someone who merely guessed the phone number.
+        gtok = session.get("guest_token", "") or ""
+        tok_q = ("&t=" + gtok) if gtok else ""
+        food_url = f"{BASE_URL}/food/{slug}?r={room}&p={phone}{tok_q}"
+        svc_url  = f"{BASE_URL}/menu/{slug}?r={room}&p={phone}{tok_q}"
+        bill_url = f"{BASE_URL}/bill/{slug}?phone={phone}{tok_q}"
         await send_text(instance, phone,
             f"👋 *Namaste {fname}!*\n\n🏨 Room: *{room}*\n📅 Checkout: {fmt_date(co_date)}\n\n"
             f"━━━━━━━━━━━━━━━━━━\n*How can I help you?*\n\n"
@@ -367,7 +373,9 @@ async def handle_guest(phone, text, UP, session, hotel, instance, hid, h_name,
         # Pull real items from the new food module. Fall back to the legacy
         # menu_url string if the hotel hasn't built a menu yet.
         items = await db.list_food_items(hid, available_only=True)
-        svc_url = f"{BASE_URL}/food/{slug}?r={room}&p={phone}&n={fname}&b={bid}"
+        gtok = session.get("guest_token", "") or ""
+        tok_q = ("&t=" + gtok) if gtok else ""
+        svc_url = f"{BASE_URL}/food/{slug}?r={room}&p={phone}&n={fname}&b={bid}{tok_q}"
         if not items:
             if menu_url:
                 await send_text(instance, phone,
@@ -518,6 +526,11 @@ async def approve_guest(target, staff_phone, hotel, instance, hid, h_name):
         await send_text(instance, staff_phone, f"ℹ️ {sess.get('name',target)} is already {sess.get('status')}"); return
     sess["status"] = "ORDERING"
     sess["menuToken"] = sec.token_urlsafe(8)
+    # Mint a guest_token if the session predates this field (e.g. the
+    # registration happened before this PR shipped). New sessions already
+    # have one from api_register; we just preserve it.
+    if not sess.get("guest_token"):
+        sess["guest_token"] = sec.token_urlsafe(24)
     sess["approvedAt"] = ist_now().isoformat()
     co = sess.get("checkoutDate","")
     ttl = calc_ttl(co)
@@ -530,6 +543,8 @@ async def approve_guest(target, staff_phone, hotel, instance, hid, h_name):
     await db.execute("UPDATE bookings SET status='Active',updated_at=NOW() WHERE booking_id=$1", bid)
     from config.settings import BASE_URL
     slug = hotel.get("slug","")
+    gtok = sess.get("guest_token", "") or ""
+    tok_q = ("&t=" + gtok) if gtok else ""
     await send_text(instance, staff_phone,
         f"✅ *Approved!*\n👤 {name}\n🏨 Room {room}\n📱 {target}")
     await send_text(instance, target,
@@ -537,9 +552,9 @@ async def approve_guest(target, staff_phone, hotel, instance, hid, h_name):
         f"🏨 Welcome to *{h_name}*, {name.split()[0]}!\n\n"
         f"🛏️ Room: *{room}*\n📅 Checkout: {fmt_date(co)}\n🔖 {bid}\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
-        f"🍽️ Order food: {BASE_URL}/food/{slug}?r={room}&p={target}\n"
-        f"🛎️ Services: {BASE_URL}/menu/{slug}?r={room}&p={target}\n"
-        f"💰 Bill: {BASE_URL}/bill/{slug}?phone={target}\n\n"
+        f"🍽️ Order food: {BASE_URL}/food/{slug}?r={room}&p={target}{tok_q}\n"
+        f"🛎️ Services: {BASE_URL}/menu/{slug}?r={room}&p={target}{tok_q}\n"
+        f"💰 Bill: {BASE_URL}/bill/{slug}?phone={target}{tok_q}\n\n"
         f"Type *hi* anytime for help! 🙏\n"
         f"📞 Emergency: {hotel.get('emergency_number','')}\n"
         f"📶 WiFi: {hotel.get('wifi_name','')} / {hotel.get('wifi_password','')}")
@@ -710,15 +725,21 @@ def _check_webhook_auth(request: Request) -> bool:
     forged `messages.upsert` body with their phone matching a staff
     `whatsapp_number`, then fire APPROVE / REJECT / CASH RECEIVED /
     PAY CONFIRM / FREE / CHECKOUT / BLOCK / UNBLOCK on any hotel.
+
+    The boot-time guard in `main.py` refuses to start when the key is
+    unset unless the operator explicitly opts out with
+    `WEBHOOK_AUTH_OPTOUT=1` for a short migration window — in that case
+    we still log every accepted hit at WARNING. In every other
+    configuration the env var is guaranteed to be set by the time we
+    get here, so the fail-open branch is gone.
     """
     if not _WEBHOOK_KEY:
-        # Operator hasn't rotated yet; log loudly but don't block. As soon
-        # as WEBHOOK_API_KEY (or EVOLUTION_API_KEY) is set, the route locks
-        # down. This matches the gradual-migration approach used elsewhere
-        # in this PR.
+        # Migration-window opt-out only — boot guard validates the env.
         logger.warning(
-            "WhatsApp webhook accepted without auth — set WEBHOOK_API_KEY (or "
-            "EVOLUTION_API_KEY) env var to enable signature verification."
+            "WhatsApp webhook accepted without auth (WEBHOOK_AUTH_OPTOUT=1). "
+            "This is intended for short migrations only — set "
+            "WEBHOOK_API_KEY (or EVOLUTION_API_KEY) and remove the opt-out "
+            "as soon as possible."
         )
         return True
     provided = (request.headers.get("apikey") or

@@ -1,8 +1,11 @@
 import json
+import hmac
+import secrets
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from services import database as db
-from services.cache import get_session, set_session, set_room, calc_ttl, get_room as cache_get_room
+from services.cache import (get_session, set_session, set_room, calc_ttl,
+                             get_room as cache_get_room, rate_limit_check)
 from services.whatsapp import send_text, send_to_phones
 from services.helpers import (booking_id as gen_bk, calc_nights, fmt_date, ist_now,
                               categorize_service, request_id as gen_sr,
@@ -12,6 +15,51 @@ import logging
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for rate-limit bucketing.
+
+    Behind a reverse proxy, `request.client.host` is the proxy itself —
+    so we honour `X-Forwarded-For` (first hop) when present. This is a
+    simple input for non-billing decisions; a malicious operator could
+    spoof the header, but the per-slug+phone bucket below provides a
+    second axis that is not spoofable.
+    """
+    xff = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if xff:
+        return xff[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
+async def _get_guest_token_session(phone: str, token: str):
+    """Load the Redis session for `phone` and verify it carries a guest_token
+    matching `token` (constant time). Returns the session dict on success,
+    None otherwise.
+
+    Sessions created BEFORE this PR don't carry a `guest_token`. To avoid
+    locking those guests out for the rest of their stay (TTL up to 24h),
+    callers MAY treat a tokenless session as "legacy" and fall back to
+    the previous phone+slug+active-booking behaviour — see how each guest
+    endpoint handles the `legacy` return value below.
+
+    Returns:
+        ("ok", session_dict)   — token matches, full access
+        ("legacy", session)    — session predates this PR, no token to check
+        ("none", None)         — no session for this phone
+        ("bad", None)          — session exists with a token, but submitted
+                                  token is missing/wrong
+    """
+    sess = await get_session(phone)
+    if not sess:
+        return "none", None
+    expected = sess.get("guest_token") or ""
+    if not expected:
+        return "legacy", sess
+    submitted = (token or "").encode("utf-8")
+    if not submitted or not hmac.compare_digest(expected.encode("utf-8"), submitted):
+        return "bad", None
+    return "ok", sess
 
 
 def themed(hotel: dict, title: str, body: str) -> str:
@@ -387,12 +435,19 @@ async def bill_page(slug: str, request: Request):
 </div>
 <div id="bDiv" style="display:none"></div>
 <script>
+// Per-guest token delivered via the bot's WhatsApp URLs (/bill/{{slug}}?phone=...&t=...).
+// The /api/guest/bill endpoint validates this against the Redis session
+// before returning data, so a stranger who only knows a phone cannot
+// pull the bill. Empty string for legacy in-stay sessions that predate
+// the change — endpoint keeps falling back to phone+slug for those.
+const URL_PARAMS=new URLSearchParams(window.location.search);
+const GUEST_TOKEN=URL_PARAMS.get('t')||URL_PARAMS.get('token')||'';
 async function loadBill(){{
   const phone=document.getElementById('bPhone').value.trim();
   if(!phone){{showToast('Enter your phone number',false);return;}}
-  const r=await fetch('/api/guest/bill?phone='+encodeURIComponent(phone)+'&slug='+encodeURIComponent({json.dumps(slug)}));
+  const r=await fetch('/api/guest/bill?phone='+encodeURIComponent(phone)+'&slug='+encodeURIComponent({json.dumps(slug)})+'&token='+encodeURIComponent(GUEST_TOKEN));
   const d=await r.json();
-  if(!d.found){{showToast('No active booking found',false);return;}}
+  if(!d.found){{showToast(d.error||'No active booking found',false);return;}}
   let h=`<div class="card"><div class="ct">🔖 Booking Details</div>
     <div style="font-size:13px;line-height:1.8">
       <div>👤 <b>${{d.guest_name}}</b></div>
@@ -474,7 +529,19 @@ async def api_register(request: Request):
         return JSONResponse({"success":False,"error":"Missing required fields"},400)
     room_row = await db.get_room(room, hid)
     if not room_row: return JSONResponse({"success":False,"error":f"Room {room} not found"},400)
-    if room_row.get("qr_secret") and room_row["qr_secret"] != secret:
+    # Fail CLOSED on the QR secret. The previous form
+    #     `if room_row.get("qr_secret") and room_row["qr_secret"] != secret`
+    # silently allowed registrations against any room whose qr_secret was
+    # empty (e.g. a freshly-created room before the operator generated a
+    # QR), turning the "scan the QR in your room" flow into "anyone with
+    # the slug can self-register into that room". Operators must now
+    # generate a QR (which writes a random secret) before guests can
+    # register against the room.
+    expected_secret = (room_row.get("qr_secret") or "").strip()
+    submitted_secret = (secret or "").strip()
+    if not expected_secret or not submitted_secret or not hmac.compare_digest(
+        expected_secret.encode("utf-8"), submitted_secret.encode("utf-8")
+    ):
         return JSONResponse({"success":False,"error":"Invalid QR code. Scan the QR inside your room."},400)
     occ = await cache_get_room(room)
     if occ and occ.replace("PENDING:","") != phone:
@@ -485,10 +552,17 @@ async def api_register(request: Request):
     rate = float(room_row.get("room_rate",0) or 0)
     instance = hotel["instance_name"]
     staff_phones = await db.get_staff_phones(hid)
+    # Guest session token. The bot includes this in every URL it sends to
+    # the guest's WhatsApp (food/bill/services). The /api/guest/charges,
+    # /api/guest/bill, /api/guest/food/my-orders endpoints validate it
+    # before returning data — so a stranger who just *knows* a phone (e.g.
+    # via /api/guest/lookup) can no longer pull that guest's bill.
+    guest_token = secrets.token_urlsafe(24)
     sess = {"phone":phone,"name":name,"room":room,"bookingId":bk_id,
             "checkinDate":ci,"checkoutDate":co,"status":"AWAITING_APPROVAL",
             "orders":[],"sessionType":"HOTEL","hotelId":hid,
-            "hotelName":hotel["hotel_name"],"createdAt":ist_now().isoformat(),"TTL":ttl}
+            "hotelName":hotel["hotel_name"],"createdAt":ist_now().isoformat(),"TTL":ttl,
+            "guest_token":guest_token}
     await set_session(phone, sess, ttl)
     await set_room(room, f"PENDING:{phone}", ttl)
     await db.insert_booking({"booking_id":bk_id,"room_number":room,"guest_name":name,
@@ -534,40 +608,78 @@ async def api_session(phone: str = ""):
 
 
 @router.get("/api/guest/lookup")
-async def api_lookup(slug: str = "", phone: str = ""):
+async def api_lookup(request: Request, slug: str = "", phone: str = ""):
     """
     Returning-guest auto-fill. If this phone has stayed at the hotel before,
     return name + ID-type so the registration form can pre-fill them.
     Always returns {found,...} — never errors out.
     Sensitive fields (ID number, photos) are NOT returned — guest re-enters every visit.
+
+    SECURITY: This endpoint is unauthenticated by design (the registration
+    page calls it before the guest is registered). To stop a runaway
+    scraper from enumerating the hotel's phone book, we apply two
+    independent rate-limit buckets:
+      * per source IP   — 30 lookups / minute
+      * per slug+phone  — 10 lookups / 5 minutes  (catches distributed
+        scrapers spreading guesses across many IPs against a single
+        target phone)
+    Both caps fail open if Redis is unreachable.
     """
+    s = (slug or "").strip()
+    p = (phone or "").strip()
+    # Validate phone shape early so we don't even rate-limit obvious junk.
+    if not s or not p or len(p) < 10 or len(p) > 14 or not p.isdigit():
+        return JSONResponse({"found": False})
+
+    ip = _client_ip(request)
+    if not await rate_limit_check(f"lookup:ip:{s}:{ip}", limit=30, window_seconds=60):
+        return JSONResponse(
+            {"found": False, "error": "Too many requests, please slow down."},
+            status_code=429,
+        )
+    if not await rate_limit_check(f"lookup:phone:{s}:{p}", limit=10, window_seconds=300):
+        # Don't leak which axis tripped — return the same 429 shape as the
+        # IP cap above. Logged at info so operators can spot enumeration.
+        logger.info("guest lookup throttled per slug+phone slug=%s phone=%s", s, p)
+        return JSONResponse(
+            {"found": False, "error": "Too many requests, please slow down."},
+            status_code=429,
+        )
+
     try:
-        hotel = await db.get_hotel_by_slug(slug)
+        hotel = await db.get_hotel_by_slug(s)
         if not hotel:
             return JSONResponse({"found": False})
-        info = await db.lookup_returning_guest(hotel["id"], (phone or "").strip())
+        info = await db.lookup_returning_guest(hotel["id"], p)
         return JSONResponse(info or {"found": False})
     except Exception:
         return JSONResponse({"found": False})
 
 @router.get("/api/guest/charges")
-async def api_charges(phone: str = "", slug: str = "", booking_id: str = ""):
+async def api_charges(phone: str = "", slug: str = "", booking_id: str = "", token: str = ""):
     """
     Return the charges for the caller's CURRENT active booking.
 
-    SECURITY: Previously this took only `?booking_id=X` and returned charges
-    for any booking system-wide — combined with predictable booking_ids,
-    that was a one-step enumeration of every guest's bill in every hotel.
-    We now require both `phone` and `slug` and look up the active booking
-    server-side, so the caller can only ever see their own charges. The
-    legacy `booking_id` parameter is accepted but only honoured when it
-    matches the active booking; otherwise it's ignored.
+    SECURITY: Bound to the per-guest session token (`guest_token`) minted
+    at registration time and delivered to the guest only via the bot's
+    WhatsApp URLs. A caller who merely *knows* a phone number (e.g. via
+    /api/guest/lookup) but never received the URL can no longer pull
+    that guest's charges.
+
+    Sessions created BEFORE this PR don't carry a token; we fall back to
+    the prior phone+slug+active-booking behaviour for them so existing
+    in-stay guests don't get locked out. New sessions strictly require
+    the token. After a single TTL window (≤24h) every active session
+    will be on the new path.
     """
     if not phone or not slug:
         return JSONResponse({"charges": []})
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel:
         return JSONResponse({"charges": []})
+    state, _ = await _get_guest_token_session(phone.strip(), token)
+    if state == "bad":
+        return JSONResponse({"charges": [], "error": "Invalid session"}, status_code=403)
     bk = await db.get_active_booking_by_phone(phone.strip(), hotel["id"])
     if not bk:
         return JSONResponse({"charges": []})
@@ -578,21 +690,23 @@ async def api_charges(phone: str = "", slug: str = "", booking_id: str = ""):
     return JSONResponse({"charges": charges})
 
 @router.get("/api/guest/bill")
-async def api_bill(phone: str = "", slug: str = ""):
+async def api_bill(phone: str = "", slug: str = "", token: str = ""):
     """
     Show the bill for the caller's CURRENT active booking.
 
-    SECURITY: This used to leak the bill of any guest whose phone you
-    could guess (or get from /api/guest/lookup). It still trusts only the
-    `phone`+`slug` pair (full session-binding is in the follow-up PR), but
-    we now enforce that the booking belongs to that phone AND that hotel
-    via `get_active_booking_by_phone`, and we scope `get_charges_for_booking`
-    by hotel_id so cross-tenant bookings can't be retrieved by id.
+    SECURITY: Same session-token binding as /api/guest/charges. The
+    `phone` + `slug` pair on its own is no longer sufficient — the
+    caller must also present the `guest_token` minted at registration
+    and delivered via the bot's WhatsApp URLs. Pre-PR sessions still
+    work (legacy fallback) until they expire naturally.
     """
     if not phone or not slug:
         return JSONResponse({"found": False})
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel: return JSONResponse({"found":False})
+    state, _ = await _get_guest_token_session(phone.strip(), token)
+    if state == "bad":
+        return JSONResponse({"found": False, "error": "Invalid session"}, status_code=403)
     bk = await db.get_active_booking_by_phone(phone.strip(), hotel["id"])
     if not bk: return JSONResponse({"found":False})
     charges = await db.get_charges_for_booking(bk["booking_id"], hotel_id=hotel["id"])
@@ -693,6 +807,12 @@ async def food_page(slug: str, request: Request):
 
 <script>
 const SLUG={json.dumps(slug)};
+// Per-guest session token delivered by the bot via WhatsApp URLs
+// (/food/{{slug}}?r=...&p=...&t=...). Validated by /api/guest/food/my-orders
+// against the Redis session. Empty string falls back to legacy behaviour
+// for in-stay guests whose sessions predate this change.
+const URL_PARAMS=new URLSearchParams(window.location.search);
+const GUEST_TOKEN=URL_PARAMS.get('t')||URL_PARAMS.get('token')||'';
 let MENU=[],CATS=[],activeCat='All',gRoom='',gPhone='',gName='',gBid='';
 let cart={{}};
 
@@ -846,7 +966,7 @@ async function placeOrder(){{
 
 async function loadMyOrders(){{
   if(!gPhone) return;
-  const r=await fetch('/api/guest/food/my-orders?slug='+SLUG+'&phone='+gPhone);
+  const r=await fetch('/api/guest/food/my-orders?slug='+SLUG+'&phone='+gPhone+'&token='+encodeURIComponent(GUEST_TOKEN));
   const d=await r.json();
   const wrap=document.getElementById('myOrders');
   if(!d.orders||!d.orders.length){{ wrap.style.display='none'; return; }}
@@ -984,10 +1104,19 @@ async def api_food_order(request: Request):
 
 
 @router.get("/api/guest/food/my-orders")
-async def api_food_my_orders(slug: str = "", phone: str = ""):
+async def api_food_my_orders(slug: str = "", phone: str = "", token: str = ""):
+    """
+    SECURITY: Bound to the per-guest session token (`guest_token`).
+    See /api/guest/charges and /api/guest/bill for the full rationale.
+    Sessions created before this PR (no token) still work via legacy
+    phone+slug lookup; new sessions strictly require the token.
+    """
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel or not phone:
         return JSONResponse({"orders": []})
+    state, _ = await _get_guest_token_session(phone.strip(), token)
+    if state == "bad":
+        return JSONResponse({"orders": [], "error": "Invalid session"}, status_code=403)
     rows = await db.fetch(
         "SELECT id, status, items_json, subtotal, tax, total, notes, created_at, delivered_at "
         "FROM hotel_food_orders WHERE hotel_id=$1 AND guest_phone=$2 "
