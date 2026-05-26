@@ -4,6 +4,139 @@
 -- psql -U postgres -d your_db -f migration.sql
 -- ═══════════════════════════════════════════════════════════════════
 
+-- ── 0. Base tables (required for fresh deployments) ──────────────
+-- These eight tables are the historical "core" of HotelFlow. On an
+-- already-running database they exist and `CREATE TABLE IF NOT EXISTS`
+-- is a no-op. On a fresh database, the section that follows
+-- ("1. Add hotel_id to all existing tables") used to fail with
+-- `ERROR: relation "bookings" does not exist`, leaving the deploy
+-- broken. Defining them here closes that gap.
+--
+-- Columns are kept minimal: every column is exercised by the runtime
+-- code (services/database.py / routes/*.py). Newer compliance and
+-- reporting columns are added later in this file via
+-- ALTER TABLE ... ADD COLUMN IF NOT EXISTS so they are also reachable
+-- by long-lived deployments.
+
+CREATE TABLE IF NOT EXISTS bookings (
+    id                  SERIAL PRIMARY KEY,
+    booking_id          VARCHAR(40)  UNIQUE NOT NULL,
+    room_number         VARCHAR(20)  DEFAULT '',
+    guest_name          VARCHAR(200) DEFAULT '',
+    guest_phone         VARCHAR(40)  DEFAULT '',
+    guest_email         VARCHAR(200) DEFAULT '',
+    guest_count         INTEGER      DEFAULT 1,
+    alternate_phone     VARCHAR(40)  DEFAULT '',
+    checkin_date        TIMESTAMP,
+    checkout_date       TIMESTAMP,
+    status              VARCHAR(20)  DEFAULT 'Active',  -- Active/Rejected/CheckedOut/Cancelled
+    payment_mode        VARCHAR(40)  DEFAULT 'Pay at checkout',
+    id_proof_type       VARCHAR(40)  DEFAULT '',
+    id_proof_number     VARCHAR(80)  DEFAULT '',
+    id_proof_photo      TEXT         DEFAULT '',
+    id_proof_photo_back TEXT         DEFAULT '',
+    total_paid          NUMERIC(12,2) DEFAULT 0,
+    hotel_id            INTEGER      DEFAULT 1,
+    created_at          TIMESTAMP    DEFAULT NOW(),
+    updated_at          TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS rooms (
+    id           SERIAL PRIMARY KEY,
+    room_number  VARCHAR(20)  UNIQUE NOT NULL,
+    room_type    VARCHAR(80)  DEFAULT 'Standard',
+    floor        INTEGER      DEFAULT 1,
+    room_rate    NUMERIC(10,2) DEFAULT 0,
+    qr_secret    VARCHAR(60)  DEFAULT '',
+    status       VARCHAR(20)  DEFAULT 'Vacant',         -- Vacant/Occupied/OutOfOrder
+    hotel_id     INTEGER      DEFAULT 1,
+    created_at   TIMESTAMP    DEFAULT NOW(),
+    updated_at   TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS stay_charges (
+    id              SERIAL PRIMARY KEY,
+    booking_id      VARCHAR(40)  NOT NULL,
+    charge_date     DATE         DEFAULT CURRENT_DATE,
+    service_type    VARCHAR(60)  DEFAULT '',
+    description     TEXT         DEFAULT '',
+    amount          NUMERIC(10,2) DEFAULT 0,
+    tax             NUMERIC(10,2) DEFAULT 0,
+    total           NUMERIC(10,2) DEFAULT 0,
+    payment_status  VARCHAR(20)  DEFAULT 'Pending',     -- Pending/Paid/Refunded
+    payment_method  VARCHAR(40)  DEFAULT '',
+    order_ref       VARCHAR(200) DEFAULT '',
+    hotel_id        INTEGER      DEFAULT 1,
+    created_at      TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS payment_logs (
+    id              SERIAL PRIMARY KEY,
+    booking_id      VARCHAR(40)  DEFAULT '',
+    guest_phone     VARCHAR(40)  DEFAULT '',
+    room_number     VARCHAR(20)  DEFAULT '',
+    guest_name      VARCHAR(200) DEFAULT '',
+    amount          NUMERIC(12,2) DEFAULT 0,
+    payment_method  VARCHAR(40)  DEFAULT '',
+    reference       VARCHAR(200) DEFAULT '',
+    payment_date    TIMESTAMP    DEFAULT NOW(),
+    hotel_id        INTEGER      DEFAULT 1,
+    created_at      TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS services (
+    id            SERIAL PRIMARY KEY,
+    service_name  VARCHAR(150) NOT NULL,
+    category      VARCHAR(80)  DEFAULT 'Other',
+    price         NUMERIC(10,2) DEFAULT 0,
+    department    VARCHAR(80)  DEFAULT 'Reception',
+    description   TEXT         DEFAULT '',
+    is_active     BOOLEAN      DEFAULT TRUE,
+    hotel_id      INTEGER      DEFAULT 1,
+    created_at    TIMESTAMP    DEFAULT NOW(),
+    updated_at    TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS staff_departments (
+    id              SERIAL PRIMARY KEY,
+    department      VARCHAR(80)  NOT NULL,
+    display_name    VARCHAR(150) DEFAULT '',
+    whatsapp_number VARCHAR(40)  DEFAULT '',
+    is_active       BOOLEAN      DEFAULT TRUE,
+    hotel_id        INTEGER      DEFAULT 1,
+    created_at      TIMESTAMP    DEFAULT NOW(),
+    updated_at      TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS service_requests (
+    id             SERIAL PRIMARY KEY,
+    request_id     VARCHAR(40)  UNIQUE NOT NULL,
+    booking_id     VARCHAR(40)  DEFAULT '',
+    service_name   VARCHAR(150) DEFAULT '',
+    category       VARCHAR(80)  DEFAULT '',
+    department     VARCHAR(80)  DEFAULT '',
+    status         VARCHAR(20)  DEFAULT 'Pending',     -- Pending/Completed/Cancelled
+    priority       VARCHAR(20)  DEFAULT 'Normal',
+    guest_note     TEXT         DEFAULT '',
+    charge_amount  NUMERIC(10,2) DEFAULT 0,
+    requested_at   TIMESTAMP    DEFAULT NOW(),
+    completed_at   TIMESTAMP,
+    hotel_id       INTEGER      DEFAULT 1,
+    created_at     TIMESTAMP    DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS additional_booking_guests (
+    id                  SERIAL PRIMARY KEY,
+    booking_id          VARCHAR(40)  NOT NULL,
+    guest_name          VARCHAR(200) DEFAULT '',
+    id_proof_type       VARCHAR(40)  DEFAULT '',
+    id_proof_number     VARCHAR(80)  DEFAULT '',
+    id_proof_photo      TEXT         DEFAULT '',
+    id_proof_photo_back TEXT         DEFAULT '',
+    hotel_id            INTEGER      DEFAULT 1,
+    created_at          TIMESTAMP    DEFAULT NOW()
+);
+
 -- ── 1. Add hotel_id to all existing tables (safe) ────────────────
 ALTER TABLE bookings                  ADD COLUMN IF NOT EXISTS hotel_id INTEGER DEFAULT 1;
 ALTER TABLE rooms                     ADD COLUMN IF NOT EXISTS hotel_id INTEGER DEFAULT 1;
@@ -199,15 +332,21 @@ CREATE INDEX IF NOT EXISTS idx_food_orders_room    ON hotel_food_orders(room_num
 -- to insert a row. See services/database.py for details.
 -- (Intentionally no INSERT INTO admin_users here — set ADMIN_PASSWORD in env.)
 
--- ── 7. Seed your existing hotel (safe, skips if exists) ───────────
-INSERT INTO hotels (hotel_name, slug, instance_name, primary_color, secondary_color,
-    emergency_number, wifi_name, wifi_password, payment_mode,
-    staff_phones, report_phones, checkout_hour, late_charge_flat, gotenberg_url, is_active)
-VALUES ('Grand Stay Hotel', 'grand-stay', 'Propertybaajar',
-    '#c8a84b', '#1a2942', '917340226277', 'HotelWifi', 'wifi@123',
-    'razorpay', ARRAY['917340226277','917413049091'],
-    ARRAY['917340226277','917413049091'], 11, 500, 'http://localhost:3000', TRUE)
-ON CONFLICT (slug) DO NOTHING;
+-- ── 7. Seed your existing hotel ───────────────────────────────────
+-- The previous version of this file shipped real WhatsApp numbers and an
+-- instance name belonging to a specific deployment, leaking PII into every
+-- clone of the repo. Hotels are now created at runtime via the master admin
+-- dashboard (POST /api/admin/hotels) — see services/database.create_hotel().
+-- If you want to seed a placeholder hotel for local development, copy the
+-- example below, fill in your own values, and run it manually:
+--
+-- INSERT INTO hotels (hotel_name, slug, instance_name, primary_color,
+--                    secondary_color, payment_mode, checkout_hour,
+--                    late_charge_flat, gotenberg_url, is_active)
+-- VALUES ('Example Hotel', 'example-hotel', 'example-instance',
+--         '#c8a84b', '#1a2942', 'razorpay', 11, 500,
+--         'http://localhost:3000', TRUE)
+-- ON CONFLICT (slug) DO NOTHING;
 
 SELECT 'Migration complete ✓' AS result;
 SELECT 'IMPORTANT: Change admin password at /admin after first login!' AS warning;
