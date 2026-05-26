@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import logging, os
 
-from config.settings import HOST, PORT
+from config.settings import HOST, PORT, SECRET_KEY
 from services.database import get_pool, close_pool, ensure_admin_seed, ensure_schema_v2
 from services.cache import get_redis, close_redis
 from scheduler.setup import start_scheduler, stop_scheduler
@@ -21,6 +21,23 @@ from routes.reports_routes import get_routers as reports_routers
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# ── Refuse to start with the placeholder SECRET_KEY ──────────────────────────
+# SECRET_KEY is reserved for session/cookie/JWT signing. Booting with the
+# placeholder "changeme" (or with no value) would silently weaken any future
+# crypto that picks it up — so we fail fast here, before the app starts
+# accepting traffic. Set a strong unique value via the env var.
+#   python -c "import secrets; print(secrets.token_urlsafe(48))"
+if not SECRET_KEY or SECRET_KEY == "changeme":
+    logger.critical(
+        "SECRET_KEY is not set (or still the default 'changeme'). "
+        "Refusing to start — set a strong, unique SECRET_KEY env var."
+    )
+    raise SystemExit(
+        "SECRET_KEY must be set to a strong, unique value before starting "
+        "HotelFlow. Generate one with: "
+        "python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+    )
 
 FRONTEND = os.path.join(os.path.dirname(__file__), "frontend")
 
