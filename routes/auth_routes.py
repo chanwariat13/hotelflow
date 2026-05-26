@@ -1,6 +1,7 @@
 """
 routes/auth_routes.py — Login/logout for all roles
 """
+import os
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from services import database as db
@@ -13,6 +14,17 @@ router = APIRouter(prefix="/auth")
 TOKEN_TTL = 28800
 
 
+def _truthy(val: str) -> bool:
+    return (val or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# When serving over HTTPS in production, set COOKIE_SECURE=1 in env so the
+# cookie is only sent on TLS connections. Default off so local http://localhost
+# development still works without flipping anything.
+_COOKIE_SECURE = _truthy(os.getenv("COOKIE_SECURE", ""))
+_COOKIE_SAMESITE = (os.getenv("COOKIE_SAMESITE", "lax").strip().lower() or "lax")
+
+
 # Cookie attributes shared by all auth responses.
 # IMPORTANT: set these on the JSONResponse we return, NOT on a separately
 # injected Response — otherwise FastAPI silently drops the cookie because
@@ -23,8 +35,8 @@ def _set_auth_cookie(resp: JSONResponse, token: str):
         value=token,
         max_age=TOKEN_TTL,
         httponly=True,
-        samesite="lax",
-        secure=False,  # set True if you only ever serve over HTTPS
+        samesite=_COOKIE_SAMESITE,
+        secure=_COOKIE_SECURE,
         path="/",
     )
 

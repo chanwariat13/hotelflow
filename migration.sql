@@ -190,17 +190,14 @@ CREATE INDEX IF NOT EXISTS idx_food_orders_hotel   ON hotel_food_orders(hotel_id
 CREATE INDEX IF NOT EXISTS idx_food_orders_booking ON hotel_food_orders(booking_id);
 CREATE INDEX IF NOT EXISTS idx_food_orders_room    ON hotel_food_orders(room_number, status);
 
--- ── 6. Seed master admin (change password after first login!) ─────
--- Default: admin / admin123  ← CHANGE THIS IMMEDIATELY
--- Hash format expected by services/auth.py:verify_password():
---   sha256(salt || password)  stored as  "<hex_hash>:<salt>"
--- Below: salt = 'defaultsalt', password = 'admin123'
-INSERT INTO admin_users (username, password_hash, name)
-VALUES (
-    'admin',
-    '86908ee61ea114e1728cf0613c977cb70a5f2a73b56e4db9990a4fab8561ae92:defaultsalt',
-    'Super Admin'
-) ON CONFLICT (username) DO NOTHING;
+-- ── 6. Master admin: seeded automatically by services/database.ensure_admin_seed() ──
+-- The previous version of this migration shipped a hard-coded password hash for
+-- the user 'admin' which the application's verify_password() couldn't actually
+-- verify (the seed format was incompatible with the runtime hash format). The
+-- application now seeds the admin user from the ADMIN_USERNAME / ADMIN_PASSWORD
+-- env vars on first boot via ensure_admin_seed(), so this SQL no longer needs
+-- to insert a row. See services/database.py for details.
+-- (Intentionally no INSERT INTO admin_users here — set ADMIN_PASSWORD in env.)
 
 -- ── 7. Seed your existing hotel (safe, skips if exists) ───────────
 INSERT INTO hotels (hotel_name, slug, instance_name, primary_color, secondary_color,
