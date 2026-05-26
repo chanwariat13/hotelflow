@@ -1,4 +1,4 @@
-import hashlib, secrets, logging
+import hashlib, hmac, secrets, logging
 from typing import Optional, Dict
 from fastapi import Request, HTTPException
 
@@ -16,9 +16,16 @@ def hash_password(pw: str) -> str:
     return f"{h}:{salt}"
 
 def verify_password(pw: str, stored: str) -> bool:
-    if ":" not in stored: return False
-    h, salt = stored.split(":",1)
-    return hashlib.sha256((salt+pw).encode()).hexdigest() == h
+    if ":" not in stored:
+        return False
+    h, salt = stored.split(":", 1)
+    # Constant-time compare to avoid timing-side-channel leaks on the admin /
+    # owner login forms. Combined with the `==` previously used here, an
+    # attacker could otherwise narrow the hash byte-by-byte.
+    return hmac.compare_digest(
+        hashlib.sha256((salt + pw).encode()).hexdigest(),
+        h,
+    )
 
 def apply_role_defaults(role: str, overrides: dict = None) -> dict:
     perms = dict(ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["staff"]))

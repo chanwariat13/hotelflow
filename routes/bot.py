@@ -29,8 +29,17 @@ def extract_msg(body: dict):
             msg.get("extendedTextMessage",{}).get("text") or
             msg.get("imageMessage",{}).get("caption") or "")
     if not text: return None, None
-    phone = data.get("key",{}).get("remoteJid","").replace("@s.whatsapp.net","").replace("@g.us","")
-    if not phone or "-" in phone: return None, None
+    # Filter group / status JIDs by the @g.us suffix above. The previous
+    # `"-" in phone` heuristic also rejected legitimate WhatsApp LID-format
+    # senders that some Evolution API versions emit, silently dropping their
+    # messages. Group chats are already filtered by the .replace("@g.us","")
+    # path above.
+    phone = data.get("key",{}).get("remoteJid","")
+    if "@g.us" in phone:
+        return None, None
+    phone = phone.replace("@s.whatsapp.net","").replace("@g.us","")
+    if not phone:
+        return None, None
     return phone, text.strip()
 
 
@@ -96,12 +105,21 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # REJECT <phone>
     m = re.match(r"^REJECT\s+(\d+)$", UP)
     if m:
+        if not can("can_reject_checkin"):
+            await send_text(instance, phone, "⛔ You don't have permission to reject check-ins."); return
         target = m.group(1)
         sess = await get_session(target)
         room = sess.get("room","") if sess else ""
         await delete_session(target)
         if room: await delete_room(room)
-        await db.execute("UPDATE bookings SET status='Rejected',updated_at=NOW() WHERE guest_phone=$1 AND status='Active'", target)
+        # Scope to THIS hotel only — previously this UPDATE had no hotel_id
+        # filter, so a staff member at hotel A could reject every active
+        # booking for that phone across every hotel in the system.
+        await db.execute(
+            "UPDATE bookings SET status='Rejected',updated_at=NOW() "
+            "WHERE guest_phone=$1 AND status='Active' AND hotel_id=$2",
+            target, hid,
+        )
         await send_text(instance, phone, f"❌ Rejected: {target} | Room: {room}")
         await send_text(instance, target, "❌ *Check-in Rejected*\nPlease contact reception. 🙏")
         return
@@ -109,18 +127,24 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # CASH RECEIVED <phone>
     m = re.match(r"^CASH\s+RECEIVED\s+(\d+)$", UP)
     if m:
+        if not can("can_checkout_guest"):
+            await send_text(instance, phone, "⛔ You don't have permission to confirm payments."); return
         await process_cash(m.group(1), phone, hotel, instance, hid)
         return
 
     # PAY CONFIRM R<room> <amount>
     m = re.match(r"^PAY\s+CONFIRM\s+R(\w+)\s+(\d+(?:\.\d+)?)$", UP)
     if m:
+        if not can("can_checkout_guest"):
+            await send_text(instance, phone, "⛔ You don't have permission to confirm payments."); return
         await confirm_payment(m.group(1), float(m.group(2)), phone, hotel, instance, hid)
         return
 
     # FREE R<room>
     m = re.match(r"^FREE\s+R(\w+)$", UP)
     if m:
+        if not can("can_manage_rooms"):
+            await send_text(instance, phone, "⛔ You don't have permission to free rooms."); return
         room = m.group(1)
         rph = await cache_get_room(room)
         if rph:
@@ -133,6 +157,8 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # BILL R<room>
     m = re.match(r"^BILL\s+R(\w+)$", UP)
     if m:
+        if not can("can_view_revenue"):
+            await send_text(instance, phone, "⛔ You don't have permission to send bills."); return
         bk = await db.get_active_booking_by_room(m.group(1), hid)
         if bk:
             await send_bill(bk, hotel, instance, gotenberg)
@@ -144,6 +170,8 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # CHECKOUT R<room>
     m = re.match(r"^CHECKOUT\s+R(\w+)$", UP)
     if m:
+        if not can("can_checkout_guest"):
+            await send_text(instance, phone, "⛔ You don't have permission to checkout guests."); return
         bk = await db.get_active_booking_by_room(m.group(1), hid)
         if not bk:
             await send_text(instance, phone, f"⚠️ No active booking for Room {m.group(1)}"); return
@@ -154,6 +182,9 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # STATUS R<room>
     m = re.match(r"^STATUS\s+R(\w+)$", UP)
     if m:
+        if not can("can_view_revenue"):
+            # STATUS reveals balance due — gate behind revenue permission.
+            await send_text(instance, phone, "⛔ You don't have permission to view room status."); return
         bk = await db.get_active_booking_by_room(m.group(1), hid)
         if bk:
             bal = float(bk.get("balance_due",0))
@@ -165,7 +196,7 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
         await send_text(instance, phone, msg)
         return
 
-    # ROOMS
+    # ROOMS  (any active staff can view occupancy — no money exposure)
     if UP in ("ROOMS","ROOM STATUS","ALL ROOMS"):
         rooms = await db.get_all_rooms(hid)
         now = datetime.now(IST).strftime("%I:%M %p")
@@ -181,6 +212,8 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
 
     # SALES
     if UP == "SALES":
+        if not can("can_view_revenue"):
+            await send_text(instance, phone, "⛔ You don't have permission to view revenue."); return
         r = await db.get_daily_revenue(hid)
         msg = (f"📊 *TODAY'S REVENUE*\n━━━━━━━━━━━━━━━━━━\n"
                f"🏠 Room Rent: ₹{float(r.get('room_revenue',0)):.0f}\n"
@@ -196,6 +229,8 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # QR R<room>
     m = re.match(r"^QR\s+R(\w+)$", UP)
     if m:
+        if not can("can_manage_rooms"):
+            await send_text(instance, phone, "⛔ You don't have permission to view QR codes."); return
         room = m.group(1)
         room_row = await db.get_room(room, hid)
         if not room_row:
@@ -217,9 +252,15 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
 
     # BLOCK / UNBLOCK
     m = re.match(r"^BLOCK\s+(\d+)$", UP)
-    if m: await block_user(m.group(1)); await send_text(instance, phone, f"🚫 {m.group(1)} blocked."); return
+    if m:
+        if not can("can_manage_staff"):
+            await send_text(instance, phone, "⛔ Only owners/managers can block users."); return
+        await block_user(m.group(1)); await send_text(instance, phone, f"🚫 {m.group(1)} blocked."); return
     m = re.match(r"^UNBLOCK\s+(\d+)$", UP)
-    if m: await unblock_user(m.group(1)); await send_text(instance, phone, f"✅ {m.group(1)} unblocked."); return
+    if m:
+        if not can("can_manage_staff"):
+            await send_text(instance, phone, "⛔ Only owners/managers can unblock users."); return
+        await unblock_user(m.group(1)); await send_text(instance, phone, f"✅ {m.group(1)} unblocked."); return
 
     # BROADCAST <msg>
     m = re.match(r"^BROADCAST\s+(.+)$", text, re.DOTALL | re.IGNORECASE)
@@ -245,6 +286,8 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # EXTEND CONFIRM <bid> <date>
     m = re.match(r"^EXTEND\s+CONFIRM\s+(\w+)\s+(\d{4}-\d{2}-\d{2})$", UP)
     if m:
+        if not can("can_checkout_guest"):
+            await send_text(instance, phone, "⛔ You don't have permission to confirm extensions."); return
         bid, new_date = m.group(1), m.group(2)
         bk = await db.get_booking_by_id(bid)
         if bk:
@@ -576,9 +619,10 @@ async def process_cash(target, staff_phone, hotel, instance, hid):
     bal = await db.get_balance_due(bid)
     if bal <= 0: await send_text(instance, staff_phone, f"ℹ️ No dues for {name} Room {room}"); return
     await db.mark_charges_paid(bid, "Cash", "CASH RECEIVED")
-    await db.insert_payment_log({"booking_id":bid,"guest_phone":target,"room_number":room,
-        "guest_name":name,"amount":bal,"payment_method":"Cash","hotel_id":hid})
-    await db.execute("UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2", bal, bid)
+    inserted = await db.insert_payment_log({"booking_id":bid,"guest_phone":target,"room_number":room,
+        "guest_name":name,"amount":bal,"payment_method":"Cash","reference":"","hotel_id":hid})
+    if inserted:
+        await db.execute("UPDATE bookings SET total_paid=COALESCE(total_paid,0)+$1,updated_at=NOW() WHERE booking_id=$2", bal, bid)
     await send_text(instance, staff_phone, f"✅ Cash ₹{bal:.0f} recorded\n👤 {name} · Room {room}")
     await send_text(instance, target, f"✅ *Cash Payment Confirmed!*\n💰 ₹{bal:.0f} received\n🏨 Room: {room}\nThank you! 🙏")
 
@@ -586,12 +630,24 @@ async def confirm_payment(room, amount, staff_phone, hotel, instance, hid):
     bk = await db.get_active_booking_by_room(room, hid)
     if not bk: await send_text(instance, staff_phone, f"⚠️ No active booking for Room {room}"); return
     bid = bk["booking_id"]; phone = bk["guest_phone"]; name = bk["guest_name"]
+    # Cap at the actual outstanding balance so a fat-fingered "PAY CONFIRM
+    # R101 1000000" can't credit more than the guest actually owes. If the
+    # amount exceeds the balance, clamp and tell the operator what was
+    # recorded.
+    bal = float(await db.get_balance_due(bid) or 0)
+    over = amount > bal + 0.5  # tolerate rounding noise
+    if bal <= 0:
+        await send_text(instance, staff_phone,
+            f"ℹ️ Room {room} has no pending dues. Nothing to confirm."); return
+    actual = min(amount, bal)
     await db.mark_charges_paid(bid, "Online", "PAY CONFIRM")
-    await db.insert_payment_log({"booking_id":bid,"guest_phone":phone,"room_number":room,
-        "guest_name":name,"amount":amount,"payment_method":"Online","hotel_id":hid})
-    await db.execute("UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2", amount, bid)
-    await send_text(instance, staff_phone, f"✅ ₹{amount:.0f} confirmed · Room {room}")
-    await send_text(instance, phone, f"✅ *Payment Confirmed!*\n💰 ₹{amount:.0f} recorded.\nThank you! 🙏")
+    inserted = await db.insert_payment_log({"booking_id":bid,"guest_phone":phone,"room_number":room,
+        "guest_name":name,"amount":actual,"payment_method":"Online","reference":"","hotel_id":hid})
+    if inserted:
+        await db.execute("UPDATE bookings SET total_paid=COALESCE(total_paid,0)+$1,updated_at=NOW() WHERE booking_id=$2", actual, bid)
+    note = f" (clamped from ₹{amount:.0f}; balance was ₹{bal:.0f})" if over else ""
+    await send_text(instance, staff_phone, f"✅ ₹{actual:.0f} confirmed · Room {room}{note}")
+    await send_text(instance, phone, f"✅ *Payment Confirmed!*\n💰 ₹{actual:.0f} recorded.\nThank you! 🙏")
 
 async def do_razorpay(phone, room, bid, name, hotel, instance, hid):
     bal = await db.get_balance_due(bid)
@@ -625,9 +681,16 @@ async def do_upi(phone, room, bid, name, hotel, instance, hid):
 async def do_service_request(phone, text, room, bid, name, hotel, instance, hid):
     cat, dept = categorize_service(text)
     sr_id = gen_sr()
+    # Escape SQL LIKE wildcards in the guest's free-text. Without this, a
+    # message containing "%" or "_" pattern-matches arbitrary services and
+    # the wrong price gets auto-billed (a "%" alone matches the first row
+    # by primary key). ESCAPE '\' lets us treat them literally.
+    needle = (text[:20] or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     price = await db.fetchval(
-        "SELECT price FROM services WHERE hotel_id=$1 AND LOWER(service_name) LIKE LOWER($2) AND is_active=TRUE LIMIT 1",
-        hid, f"%{text[:20]}%") or 0
+        "SELECT price FROM services WHERE hotel_id=$1 "
+        "AND LOWER(service_name) LIKE LOWER($2) ESCAPE '\\' "
+        "AND is_active=TRUE LIMIT 1",
+        hid, f"%{needle}%") or 0
     price = float(price)
     await db.insert_service_request({"request_id":sr_id,"phone":phone,"booking_id":bid,
         "service_name":text[:100],"category":cat,"department":dept,"price":price})

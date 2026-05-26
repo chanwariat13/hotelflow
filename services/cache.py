@@ -49,9 +49,14 @@ async def is_blocked(phone: str) -> bool:
     r = await get_redis()
     return bool(await r.get(f"blocked:{phone}"))
 
-async def block_user(phone: str):
+async def block_user(phone: str, ttl: int = 30 * 24 * 3600):
+    """
+    Block a phone for `ttl` seconds (default 30 days). Previously the key had
+    no expiry, which meant a one-time BLOCK from staff persisted forever in
+    Redis with no UI to clean it up. Use UNBLOCK or wait out the TTL.
+    """
     r = await get_redis()
-    await r.set(f"blocked:{phone}", "1")
+    await r.set(f"blocked:{phone}", "1", ex=ttl)
 
 async def unblock_user(phone: str):
     r = await get_redis()

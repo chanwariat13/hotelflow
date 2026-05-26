@@ -235,6 +235,31 @@ async def ensure_schema_v2():
         await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_by         VARCHAR(100) DEFAULT ''")
         await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_at         TIMESTAMP")
 
+        # 2b. Multi-tenant uniqueness fixes
+        # Old schema had `rooms.room_number UNIQUE` (global). With more than
+        # one hotel that constraint silently moves rooms between tenants on
+        # upsert. Drop it (best-effort) and replace with a composite unique
+        # index on (hotel_id, room_number). Idempotent: skipped on re-run.
+        try:
+            await execute("ALTER TABLE rooms DROP CONSTRAINT IF EXISTS rooms_room_number_key")
+        except Exception:
+            pass
+        await execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_hotel_room_uniq "
+            "ON rooms (hotel_id, room_number)"
+        )
+
+        # Razorpay webhook idempotency: payment provider retries the same
+        # event on any non-2xx and the previous code would double-credit
+        # `bookings.total_paid` and emit duplicate ledger rows. The unique
+        # index lets _handle_razorpay_event short-circuit on a duplicate
+        # `payment.id`. Partial index so empty references (legacy CASH /
+        # PAY CONFIRM rows) don't conflict with each other.
+        await execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_logs_reference_uniq "
+            "ON payment_logs (reference) WHERE reference IS NOT NULL AND reference <> ''"
+        )
+
         # 3. Real food/restaurant module — replaces the "menu_url is just a string"
         #    placeholder with actual menu storage and order tracking. Each food
         #    order is mirrored as a stay_charge of service_type='Food' so the
@@ -498,11 +523,18 @@ async def get_room(room_number: str, hid: int) -> Optional[Dict]:
     return await fetchrow("SELECT * FROM rooms WHERE room_number=$1 AND hotel_id=$2", room_number, hid)
 
 async def upsert_room(hid: int, room_number: str, room_type: str, floor: int, rate: float, qr_secret: str):
+    """
+    Upsert keyed on (hotel_id, room_number). Previously the ON CONFLICT target
+    was `room_number` alone, which is globally unique across all hotels; so the
+    moment hotel B onboarded a room "101" the row would be reassigned to hotel
+    B and silently disappear from hotel A. Requires the unique index
+    `idx_rooms_hotel_room_uniq` created in ensure_schema_v2.
+    """
     await execute("""
         INSERT INTO rooms (room_number,room_type,floor,room_rate,qr_secret,status,hotel_id)
         VALUES ($1,$2,$3,$4,$5,'Vacant',$6)
-        ON CONFLICT (room_number) DO UPDATE
-        SET room_type=$2,floor=$3,room_rate=$4,qr_secret=$5,hotel_id=$6,updated_at=NOW()""",
+        ON CONFLICT (hotel_id, room_number) DO UPDATE
+        SET room_type=$2,floor=$3,room_rate=$4,qr_secret=$5,updated_at=NOW()""",
         room_number, room_type, floor, rate, qr_secret, hid)
 
 async def update_room_rate(room_number: str, new_rate: float, hid: int):
@@ -513,7 +545,12 @@ async def update_room_rate(room_number: str, new_rate: float, hid: int):
 async def set_room_occupied(room: str, hid: int):
     await execute("UPDATE rooms SET status='Occupied',updated_at=NOW() WHERE room_number=$1 AND hotel_id=$2", room, hid)
 
-async def set_room_vacant(room: str, hid: int = 1):
+async def set_room_vacant(room: str, hid: int):
+    """
+    Mark a room vacant. `hid` is REQUIRED — previously it defaulted to 1, which
+    would silently mutate hotel #1's rooms whenever a contributor forgot the
+    second arg in a multi-tenant deployment.
+    """
     await execute("UPDATE rooms SET status='Vacant',updated_at=NOW() WHERE room_number=$1 AND hotel_id=$2", room, hid)
 
 async def get_room_rate(room: str, hid: int) -> float:
@@ -634,11 +671,44 @@ async def mark_charges_paid(bid: str, method: str, ref: str):
     await execute("UPDATE stay_charges SET payment_status='Paid',payment_method=$2,order_ref=$3 WHERE booking_id=$1 AND payment_status='Pending'", bid, method, ref)
 
 async def insert_payment_log(d: Dict):
+    """
+    Record a payment. When `reference` is non-empty (e.g. Razorpay payment id)
+    we rely on `idx_payment_logs_reference_uniq` to make this idempotent —
+    a retried webhook with the same `reference` will hit ON CONFLICT and
+    return without inserting again or double-crediting the booking.
+
+    Returns True if a new row was inserted, False if a row with the same
+    non-empty reference already existed (caller should skip the post-credit
+    side-effects in that case).
+    """
+    ref = d.get("reference") or ""
+    if ref:
+        row = await fetchrow("""
+            INSERT INTO payment_logs (booking_id,guest_phone,room_number,guest_name,amount,payment_method,reference,payment_date,hotel_id)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)
+            ON CONFLICT (reference) WHERE reference IS NOT NULL AND reference <> ''
+            DO NOTHING
+            RETURNING id""",
+            d["booking_id"], d["guest_phone"], d["room_number"], d["guest_name"],
+            float(d.get("amount", 0)), d.get("payment_method", ""), ref, d["hotel_id"])
+        return bool(row)
     await execute("""
         INSERT INTO payment_logs (booking_id,guest_phone,room_number,guest_name,amount,payment_method,reference,payment_date,hotel_id)
         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)""",
-        d["booking_id"],d["guest_phone"],d["room_number"],d["guest_name"],
-        d["amount"],d["payment_method"],d.get("reference",""),d.get("hotel_id",1))
+        d["booking_id"], d["guest_phone"], d["room_number"], d["guest_name"],
+        float(d.get("amount", 0)), d.get("payment_method", ""), ref, d["hotel_id"])
+    return True
+
+
+async def is_payment_logged(reference: str) -> bool:
+    """Was a payment with this reference already recorded? Used as a defence-in-
+    depth check by the Razorpay webhook BEFORE it touches bookings.total_paid,
+    so a retried webhook never doubles the paid amount even if the unique
+    index is somehow missing (e.g. older deployments that haven't re-run
+    ensure_schema_v2 yet)."""
+    if not reference:
+        return False
+    return bool(await fetchval("SELECT 1 FROM payment_logs WHERE reference=$1 LIMIT 1", reference))
 
 async def insert_additional_guests(bid: str, guests: list, hid: int):
     if not guests: return

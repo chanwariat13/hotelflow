@@ -227,9 +227,15 @@ async def all_bookings(request: Request):
         bks = await db.fetch("SELECT b.*,COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Pending'),0) AS balance_due FROM bookings b LEFT JOIN stay_charges sc ON sc.booking_id=b.booking_id GROUP BY b.id ORDER BY b.created_at DESC LIMIT $1", limit)
     return JSONResponse({"bookings": bks})
 
-@router.post("/admin/password")
+@router.put("/password")
 async def change_admin_password(request: Request):
-    """Change the master admin password."""
+    """
+    Change the master admin password. Mounted as `PUT /api/admin/password`
+    to match the frontend (`admin.html` calls PUT /api/admin/password).
+    Previously this was POST /admin/password under the same prefix, which
+    resolved to `/api/admin/admin/password` and 404'd silently — operators
+    "saved" a new password but kept the old one.
+    """
     user = await require_superadmin(request)
     d = await request.json()
     new_pw = (d.get("new_password") or "").strip()
@@ -455,12 +461,28 @@ async def _handle_razorpay_event(hotel: dict, body: dict):
             logger.warning("razorpay event missing booking ref: %s", body.get("id", ""))
             return
 
+        # Idempotency: Razorpay retries the same event on any non-2xx response.
+        # If we've already booked this `payment.id` against payment_logs, the
+        # mark_charges_paid below is itself idempotent but the bookings.total_paid
+        # increment was NOT, so a retried event used to double-credit the guest.
+        # Short-circuit here when we've seen this reference before.
+        if ref and await db.is_payment_logged(ref):
+            logger.info("razorpay duplicate event ignored: ref=%s", ref)
+            return
+
         await db.mark_charges_paid(bid, "Online", ref)
-        await db.insert_payment_log({
+        inserted = await db.insert_payment_log({
             "booking_id": bid, "guest_phone": phone, "room_number": room,
             "guest_name": "", "amount": amount, "payment_method": "Online",
             "reference": ref, "hotel_id": hotel["id"],
         })
+        if not inserted:
+            # Lost a race against another worker handling the same event; the
+            # earlier worker already credited bookings.total_paid. Skip the
+            # post-payment side-effects so the guest doesn't get a double
+            # WhatsApp confirmation either.
+            logger.info("razorpay event lost idempotency race: ref=%s", ref)
+            return
         await db.execute(
             "UPDATE bookings SET total_paid = COALESCE(total_paid,0) + $1, updated_at=NOW() "
             "WHERE booking_id=$2",

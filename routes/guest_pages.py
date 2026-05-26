@@ -325,7 +325,7 @@ async function initGuest(){{
 }}
 async function loadBill(){{
   if(!gBid)return;
-  const r=await fetch('/api/guest/charges?booking_id='+gBid);
+  const r=await fetch('/api/guest/charges?booking_id='+encodeURIComponent(gBid)+'&phone='+encodeURIComponent(gPhone));
   const d=await r.json();
   if(d.charges&&d.charges.length){{
     let h='',tot=0;
@@ -435,8 +435,19 @@ async def api_register(request: Request):
         return JSONResponse({"success":False,"error":"Missing required fields"},400)
     room_row = await db.get_room(room, hid)
     if not room_row: return JSONResponse({"success":False,"error":f"Room {room} not found"},400)
-    if room_row.get("qr_secret") and room_row["qr_secret"] != secret:
-        return JSONResponse({"success":False,"error":"Invalid QR code. Scan the QR inside your room."},400)
+    # Tighten QR-secret check. Previously this was `if room_row.get("qr_secret")
+    # and room_row["qr_secret"] != secret:` — i.e. any room whose secret was
+    # blank (legitimate state for legacy rows or hotels that haven't run the
+    # upsert path) silently accepted any registration. Treat empty secrets as
+    # a configuration error and refuse, so the only way to register is via the
+    # in-room QR code.
+    expected = (room_row.get("qr_secret") or "").strip()
+    if not expected:
+        return JSONResponse({"success":False,
+            "error":"Room QR code not configured. Please ask reception."}, 400)
+    if expected != secret:
+        return JSONResponse({"success":False,
+            "error":"Invalid QR code. Scan the QR inside your room."}, 400)
     occ = await cache_get_room(room)
     if occ and occ.replace("PENDING:","") != phone:
         return JSONResponse({"success":False,"error":f"Room {room} is currently occupied."},400)
@@ -503,8 +514,27 @@ async def api_lookup(slug: str = "", phone: str = ""):
         return JSONResponse({"found": False})
 
 @router.get("/api/guest/charges")
-async def api_charges(booking_id: str = ""):
-    return JSONResponse({"charges": await db.get_charges_for_booking(booking_id)})
+async def api_charges(booking_id: str = "", phone: str = ""):
+    """
+    Return the line-item charges for a booking. Requires `phone` to match the
+    guest_phone on the booking — booking IDs are short timestamp-based strings
+    and were previously enumerable, letting an attacker pull every guest's
+    itemised bill by iterating sequential IDs. We keep the path stable so the
+    frontend (`bill.html`, `menu.html`) can keep using it as long as it also
+    sends the guest's WhatsApp number, which is already in the URL.
+    """
+    bid = (booking_id or "").strip()
+    ph  = (phone or "").strip()
+    if not bid or not ph:
+        return JSONResponse({"charges": [], "error": "booking_id and phone required"}, 400)
+    bk = await db.fetchrow(
+        "SELECT booking_id FROM bookings WHERE booking_id=$1 AND guest_phone=$2 LIMIT 1",
+        bid, ph,
+    )
+    if not bk:
+        # Don't reveal whether the booking exists or the phone is wrong.
+        return JSONResponse({"charges": []})
+    return JSONResponse({"charges": await db.get_charges_for_booking(bid)})
 
 @router.get("/api/guest/bill")
 async def api_bill(phone: str = "", slug: str = ""):
