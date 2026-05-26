@@ -63,19 +63,33 @@ def build_bill_html(booking: dict, charges: list, hotel: dict) -> str:
 
     by_date: dict = {}
     grand = paid = 0.0
+    cgst_total = sgst_total = igst_total = 0.0
+    inter_state = False
     for c in charges:
         dk = str(c.get("charge_date","")).split("T")[0]
         by_date.setdefault(dk,[]).append(c)
         grand += float(c.get("total",0))
+        cgst_total += float(c.get("cgst_amount") or 0)
+        sgst_total += float(c.get("sgst_amount") or 0)
+        igst_total += float(c.get("igst_amount") or 0)
+        if c.get("is_inter_state"):
+            inter_state = True
         if c.get("payment_status") == "Paid": paid += float(c.get("total",0))
+    tax_total = cgst_total + sgst_total + igst_total
+    taxable_total = grand - tax_total
 
     rows = ""
     for dk in sorted(by_date.keys()):
         dt = sum(float(c.get("total",0)) for c in by_date[dk])
-        rows += f'<tr class="dh"><td colspan="3">{fmt_date(dk)}</td><td style="text-align:right">₹{dt:,.0f}</td></tr>'
+        rows += f'<tr class="dh"><td colspan="4">{fmt_date(dk)}</td><td style="text-align:right">₹{dt:,.0f}</td></tr>'
         for c in by_date[dk]:
             ic = "✓" if c.get("payment_status")=="Paid" else "●"
-            rows += f'<tr><td><span class="tg">{c.get("service_type","")}</span></td><td>{c.get("description","")}</td><td style="text-align:center">{ic}</td><td style="text-align:right">₹{float(c.get("total",0)):,.0f}</td></tr>'
+            hsn = c.get("hsn_code") or ""
+            rows += (f'<tr><td><span class="tg">{c.get("service_type","")}</span></td>'
+                     f'<td>{c.get("description","")}</td>'
+                     f'<td style="text-align:center;font-family:monospace;font-size:10px;color:#888">{hsn}</td>'
+                     f'<td style="text-align:center">{ic}</td>'
+                     f'<td style="text-align:right">₹{float(c.get("total",0)):,.0f}</td></tr>')
 
     balance = max(grand-paid,0)
     bc = "#e74c3c" if balance>0 else "#27ae60"
@@ -94,6 +108,23 @@ def build_bill_html(booking: dict, charges: list, hotel: dict) -> str:
         f'<div class="ib"><label>Customer GSTIN</label><p style="font-family:monospace;font-size:11px">{customer_gstin}</p></div>'
         if customer_gstin else ""
     )
+
+    # Tax breakdown rows (CGST/SGST for intra-state; IGST for inter-state).
+    # Falls back gracefully for legacy charges that don't carry the split yet.
+    if tax_total > 0:
+        if inter_state or igst_total > 0:
+            tax_rows = (
+                f'<tr><td>Taxable Value</td><td style="text-align:right">₹{taxable_total:,.0f}</td></tr>'
+                f'<tr><td>IGST</td><td style="text-align:right">₹{igst_total:,.0f}</td></tr>'
+            )
+        else:
+            tax_rows = (
+                f'<tr><td>Taxable Value</td><td style="text-align:right">₹{taxable_total:,.0f}</td></tr>'
+                f'<tr><td>CGST</td><td style="text-align:right">₹{cgst_total:,.0f}</td></tr>'
+                f'<tr><td>SGST</td><td style="text-align:right">₹{sgst_total:,.0f}</td></tr>'
+            )
+    else:
+        tax_rows = ""
 
     return f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
 <style>*{{margin:0;padding:0;box-sizing:border-box;}}
@@ -131,11 +162,12 @@ td{{padding:6px 7px;border-bottom:1px solid #eee;font-size:12px;}}
   {customer_gstin_box}
 </div>
 <table>
-  <thead><tr><th>Category</th><th>Description</th><th style="text-align:center">Status</th><th style="text-align:right">Amount</th></tr></thead>
-  <tbody>{rows or '<tr><td colspan="4" style="text-align:center;color:#999;padding:14px">No charges on file</td></tr>'}</tbody>
+  <thead><tr><th>Category</th><th>Description</th><th style="text-align:center">HSN/SAC</th><th style="text-align:center">Status</th><th style="text-align:right">Amount</th></tr></thead>
+  <tbody>{rows or '<tr><td colspan="5" style="text-align:center;color:#999;padding:14px">No charges on file</td></tr>'}</tbody>
 </table>
 <div class="tot"><table>
   <tr><td>Subtotal</td><td style="text-align:right">₹{grand:,.0f}</td></tr>
+  {tax_rows}
   <tr><td>Amount Paid</td><td style="text-align:right">₹{paid:,.0f}</td></tr>
   <tr><td style="color:{bc}">Balance Due</td><td style="text-align:right;color:{bc}"><b>{bt}</b></td></tr>
   <tr class="grand"><td>GRAND TOTAL</td><td style="text-align:right">₹{grand:,.0f}</td></tr>

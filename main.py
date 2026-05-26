@@ -14,6 +14,7 @@ from routes.guest_pages import router as guest_router
 from routes.auth_routes import router as auth_router
 from routes.admin_routes import router as admin_router
 from routes.hotel_routes import router as hotel_router
+from routes.formc_routes import router as formc_router
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -60,6 +61,7 @@ app.include_router(guest_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(hotel_router)
+app.include_router(formc_router)
 
 
 @app.get("/")

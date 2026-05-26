@@ -235,6 +235,66 @@ async def ensure_schema_v2():
         await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_by         VARCHAR(100) DEFAULT ''")
         await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_at         TIMESTAMP")
 
+        # 2b. India compliance — GST place-of-supply (CGST/SGST vs IGST split)
+        # `state_code` is the GSTIN 2-digit state code of the hotel itself; we
+        # also persist legal_name + PAN for the printed tax invoice header.
+        await execute("ALTER TABLE hotels        ADD COLUMN IF NOT EXISTS state_code      VARCHAR(2)   DEFAULT ''")
+        await execute("ALTER TABLE hotels        ADD COLUMN IF NOT EXISTS legal_name      VARCHAR(200) DEFAULT ''")
+        await execute("ALTER TABLE hotels        ADD COLUMN IF NOT EXISTS pan             VARCHAR(20)  DEFAULT ''")
+        await execute("ALTER TABLE hotels        ADD COLUMN IF NOT EXISTS default_gst_rate NUMERIC(5,2) DEFAULT 12.00")
+        await execute("ALTER TABLE bookings      ADD COLUMN IF NOT EXISTS guest_state_code VARCHAR(2)  DEFAULT ''")
+        await execute("ALTER TABLE stay_charges  ADD COLUMN IF NOT EXISTS hsn_code        VARCHAR(10)  DEFAULT ''")
+        await execute("ALTER TABLE stay_charges  ADD COLUMN IF NOT EXISTS tax_rate        NUMERIC(5,2) DEFAULT 0")
+        await execute("ALTER TABLE stay_charges  ADD COLUMN IF NOT EXISTS cgst_amount     NUMERIC(10,2) DEFAULT 0")
+        await execute("ALTER TABLE stay_charges  ADD COLUMN IF NOT EXISTS sgst_amount     NUMERIC(10,2) DEFAULT 0")
+        await execute("ALTER TABLE stay_charges  ADD COLUMN IF NOT EXISTS igst_amount     NUMERIC(10,2) DEFAULT 0")
+        await execute("ALTER TABLE stay_charges  ADD COLUMN IF NOT EXISTS is_inter_state  BOOLEAN      DEFAULT FALSE")
+
+        # 2c. India compliance — Form C (FRRO) for foreign guests.
+        # Fields mirror what the indianfrro.gov.in portal asks for. We keep them
+        # flat on the bookings row; a separate `formc_filings` audit table
+        # below records each filing event for legal-defensibility.
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS is_foreign_guest      BOOLEAN     DEFAULT FALSE")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS nationality           VARCHAR(80) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS sex                   VARCHAR(10) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS date_of_birth         VARCHAR(20) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS passport_no           VARCHAR(40) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS passport_place_of_issue VARCHAR(80) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS passport_issue_date   VARCHAR(20) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS passport_expiry_date  VARCHAR(20) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS visa_no               VARCHAR(40) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS visa_type             VARCHAR(40) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS visa_issue_place      VARCHAR(80) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS visa_issue_date       VARCHAR(20) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS visa_expiry_date      VARCHAR(20) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS arrival_in_india_date VARCHAR(20) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS arrival_in_india_port VARCHAR(80) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS last_country_visited  VARCHAR(80) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS next_destination      VARCHAR(120) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS purpose_of_visit      VARCHAR(80) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS formc_status          VARCHAR(20) DEFAULT 'NotRequired'") # NotRequired/Pending/Filed/Failed
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS formc_filed_at        TIMESTAMP")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS formc_reference       VARCHAR(80) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS formc_filed_by        VARCHAR(100) DEFAULT ''")
+        await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS formc_remarks         TEXT        DEFAULT ''")
+        await execute("CREATE INDEX IF NOT EXISTS idx_bookings_formc_pending ON bookings(hotel_id, formc_status) WHERE is_foreign_guest=TRUE")
+
+        await execute("""
+            CREATE TABLE IF NOT EXISTS formc_filings (
+                id            SERIAL PRIMARY KEY,
+                hotel_id      INTEGER NOT NULL,
+                booking_id    VARCHAR(40) NOT NULL,
+                action        VARCHAR(20) NOT NULL,   -- generated / filed / failed / amended
+                reference     VARCHAR(80) DEFAULT '',
+                filed_by      VARCHAR(100) DEFAULT '',
+                payload       TEXT DEFAULT '',
+                notes         TEXT DEFAULT '',
+                created_at    TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_formc_filings_booking ON formc_filings(booking_id, created_at DESC)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_formc_filings_hotel   ON formc_filings(hotel_id, created_at DESC)")
+
         # 3. Real food/restaurant module — replaces the "menu_url is just a string"
         #    placeholder with actual menu storage and order tracking. Each food
         #    order is mirrored as a stay_charge of service_type='Food' so the
@@ -363,7 +423,7 @@ async def update_hotel(hid: int, data: Dict) -> Optional[Dict]:
         "google_maps_url","hotel_email","hotel_whatsapp","check_in_time","checkout_time_display",
         "welcome_message","footer_text","google_review_url","menu_url","emergency_number",
         "wifi_name","wifi_password","payment_mode","razorpay_key_id","razorpay_secret",
-        "razorpay_webhook_secret","gstin",
+        "razorpay_webhook_secret","gstin","state_code","legal_name","pan","default_gst_rate",
         "upi_id","upi_display_name","gotenberg_url","cloudinary_cloud_name","cloudinary_upload_preset",
         "staff_phones","report_phones","checkout_hour","late_charge_flat","late_fee_per_hour",
         "max_late_fee","svc_open_hour","svc_close_hour","sched_daily_report_hour",
@@ -584,8 +644,15 @@ async def insert_booking(d: Dict):
         INSERT INTO bookings (booking_id,room_number,guest_name,guest_phone,
             checkin_date,checkout_date,status,payment_mode,
             id_proof_type,id_proof_number,id_proof_photo,id_proof_photo_back,
-            guest_count,alternate_phone,hotel_id,customer_gstin)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+            guest_count,alternate_phone,hotel_id,customer_gstin,
+            guest_state_code,is_foreign_guest,nationality,sex,date_of_birth,
+            passport_no,passport_place_of_issue,passport_issue_date,passport_expiry_date,
+            visa_no,visa_type,visa_issue_place,visa_issue_date,visa_expiry_date,
+            arrival_in_india_date,arrival_in_india_port,last_country_visited,
+            next_destination,purpose_of_visit,formc_status)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
+                $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,
+                $31,$32,$33,$34,$35,$36)
         ON CONFLICT (booking_id) DO NOTHING""",
         d["booking_id"],d["room_number"],d["guest_name"],d["guest_phone"],
         d["checkin_date"],d["checkout_date"],d.get("status","Active"),
@@ -593,7 +660,113 @@ async def insert_booking(d: Dict):
         d.get("id_proof_type",""),d.get("id_proof_number",""),
         d.get("id_proof_photo",""),d.get("id_proof_photo_back",""),
         d.get("guest_count",1),d.get("alternate_phone",""),d.get("hotel_id",1),
-        d.get("customer_gstin",""))
+        d.get("customer_gstin",""),
+        d.get("guest_state_code",""),
+        bool(d.get("is_foreign_guest", False)),
+        d.get("nationality",""), d.get("sex",""), d.get("date_of_birth",""),
+        d.get("passport_no","").upper(), d.get("passport_place_of_issue",""),
+        d.get("passport_issue_date",""), d.get("passport_expiry_date",""),
+        d.get("visa_no","").upper(), d.get("visa_type",""),
+        d.get("visa_issue_place",""), d.get("visa_issue_date",""),
+        d.get("visa_expiry_date",""),
+        d.get("arrival_in_india_date",""), d.get("arrival_in_india_port",""),
+        d.get("last_country_visited",""), d.get("next_destination",""),
+        d.get("purpose_of_visit",""),
+        "Pending" if d.get("is_foreign_guest") else "NotRequired",
+    )
+
+# ── FormC / FRRO helpers ────────────────────────────────────────────
+async def list_formc_bookings(hid: int, status: Optional[str] = None,
+                              limit: int = 100, offset: int = 0) -> List[Dict]:
+    """Foreign-guest bookings, optionally filtered by formc_status."""
+    sql = """
+        SELECT booking_id, hotel_id, room_number, guest_name, guest_phone,
+               checkin_date, checkout_date, status,
+               nationality, sex, date_of_birth, passport_no,
+               passport_place_of_issue, passport_issue_date, passport_expiry_date,
+               visa_no, visa_type, visa_issue_place, visa_issue_date, visa_expiry_date,
+               arrival_in_india_date, arrival_in_india_port,
+               last_country_visited, next_destination, purpose_of_visit,
+               is_foreign_guest, formc_status, formc_filed_at, formc_reference,
+               formc_filed_by, formc_remarks, created_at
+        FROM bookings
+        WHERE hotel_id=$1 AND is_foreign_guest=TRUE
+    """
+    args: list = [hid]
+    if status:
+        sql += " AND formc_status=$2"
+        args.append(status)
+        sql += f" ORDER BY checkin_date DESC LIMIT ${len(args)+1} OFFSET ${len(args)+2}"
+    else:
+        sql += f" ORDER BY checkin_date DESC LIMIT ${len(args)+1} OFFSET ${len(args)+2}"
+    args += [limit, offset]
+    return await fetch(sql, *args)
+
+
+async def update_booking_foreign_fields(booking_id: str, data: Dict) -> Optional[Dict]:
+    """
+    Update foreign-guest / FormC fields on a booking. Used when an operator
+    edits the captured passport/visa details before filing.
+    """
+    allowed = [
+        "is_foreign_guest","nationality","sex","date_of_birth",
+        "passport_no","passport_place_of_issue","passport_issue_date","passport_expiry_date",
+        "visa_no","visa_type","visa_issue_place","visa_issue_date","visa_expiry_date",
+        "arrival_in_india_date","arrival_in_india_port","last_country_visited",
+        "next_destination","purpose_of_visit","formc_remarks",
+    ]
+    fields, vals, i = [], [], 1
+    for k, v in data.items():
+        if k in allowed:
+            if isinstance(v, str) and k in ("passport_no", "visa_no"):
+                v = v.upper()
+            fields.append(f"{k}=${i}"); vals.append(v); i += 1
+    # If is_foreign_guest just flipped on and status is empty/NotRequired, set Pending.
+    if "is_foreign_guest" in data:
+        if data["is_foreign_guest"]:
+            fields.append(f"formc_status=COALESCE(NULLIF(formc_status,''),'Pending')")
+        else:
+            fields.append(f"formc_status='NotRequired'")
+    if not fields:
+        return await get_booking_by_id(booking_id)
+    vals.append(booking_id)
+    return await fetchrow(
+        f"UPDATE bookings SET {','.join(fields)} WHERE booking_id=${i} RETURNING *", *vals)
+
+
+async def mark_formc_filed(booking_id: str, reference: str, filed_by: str,
+                           hotel_id: int, payload: str = "") -> Optional[Dict]:
+    """Operator clicks 'Mark Filed' after uploading the CSV to FRRO portal."""
+    row = await fetchrow("""
+        UPDATE bookings
+        SET formc_status='Filed',
+            formc_filed_at=NOW(),
+            formc_reference=$2,
+            formc_filed_by=$3
+        WHERE booking_id=$1
+        RETURNING *""", booking_id, reference[:80], filed_by[:100])
+    await execute("""
+        INSERT INTO formc_filings (hotel_id, booking_id, action, reference, filed_by, payload)
+        VALUES ($1,$2,'filed',$3,$4,$5)""",
+        hotel_id, booking_id, reference[:80], filed_by[:100], (payload or "")[:8000])
+    return row
+
+
+async def log_formc_event(hotel_id: int, booking_id: str, action: str,
+                          filed_by: str = "", payload: str = "", notes: str = ""):
+    await execute("""
+        INSERT INTO formc_filings (hotel_id, booking_id, action, filed_by, payload, notes)
+        VALUES ($1,$2,$3,$4,$5,$6)""",
+        hotel_id, booking_id, action[:20], filed_by[:100],
+        (payload or "")[:8000], (notes or "")[:1000])
+
+
+async def count_formc_pending(hid: int) -> int:
+    """Count of foreign-guest bookings still awaiting FormC filing."""
+    v = await fetchval("""
+        SELECT COUNT(*) FROM bookings
+        WHERE hotel_id=$1 AND is_foreign_guest=TRUE AND formc_status='Pending'""", hid)
+    return int(v or 0)
 
 async def checkout_booking(room: str, hid: int):
     await execute("UPDATE bookings SET status='CheckedOut',updated_at=NOW() WHERE room_number=$1 AND status='Active' AND hotel_id=$2", room, hid)
@@ -621,14 +794,54 @@ async def get_balance_due(bid: str) -> float:
     return float(v or 0)
 
 async def insert_stay_charge(d: Dict):
+    """
+    Insert a stay charge with GST split.
+
+    The caller may either provide pre-computed CGST/SGST/IGST values, or just
+    `tax_rate` + `is_inter_state` and let this function derive the split.
+    Falls back to the legacy single `tax` column if no rate is supplied — so
+    older callers (insert a flat-tax row from the dashboard) continue to work.
+    """
     from datetime import date
+    from services.gst import compute_split, hsn_for_service, split_existing_tax
+
     cd = d.get("charge_date") or date.today()
+    amount = float(d.get("amount", 0))
+    rate   = float(d.get("tax_rate", 0))
+    inter  = d.get("is_inter_state")
+
+    # If caller provided cgst/sgst/igst directly, trust them.
+    cgst = d.get("cgst_amount")
+    sgst = d.get("sgst_amount")
+    igst = d.get("igst_amount")
+
+    if cgst is None and sgst is None and igst is None:
+        if rate:
+            split = compute_split(amount, rate, inter_state=inter)
+            cgst = split["cgst"]; sgst = split["sgst"]; igst = split["igst"]
+            tax  = split["total_tax"]
+            total = split["total"]
+        else:
+            # Legacy path — caller knows total only.
+            tax  = float(d.get("tax", 0))
+            cgst, sgst, igst = split_existing_tax(amount, tax, inter_state=bool(inter))
+            total = float(d.get("total", amount + tax))
+    else:
+        cgst = float(cgst or 0); sgst = float(sgst or 0); igst = float(igst or 0)
+        tax  = cgst + sgst + igst
+        total = float(d.get("total", amount + tax))
+
+    hsn = (d.get("hsn_code") or hsn_for_service(d.get("service_type", "")))[:10]
+
     await execute("""
-        INSERT INTO stay_charges (booking_id,charge_date,service_type,description,amount,tax,total,payment_status,order_ref,hotel_id)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
-        d["booking_id"],cd,d["service_type"],d["description"],
-        d["amount"],d.get("tax",0),d["total"],
-        d.get("payment_status","Pending"),d.get("order_ref"),d.get("hotel_id",1))
+        INSERT INTO stay_charges (booking_id,charge_date,service_type,description,amount,tax,total,
+            payment_status,order_ref,hotel_id,
+            hsn_code,tax_rate,cgst_amount,sgst_amount,igst_amount,is_inter_state)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)""",
+        d["booking_id"], cd, d["service_type"], d["description"],
+        amount, tax, total,
+        d.get("payment_status", "Pending"), d.get("order_ref"), d.get("hotel_id", 1),
+        hsn, rate, cgst, sgst, igst, bool(inter or False))
 
 async def mark_charges_paid(bid: str, method: str, ref: str):
     await execute("UPDATE stay_charges SET payment_status='Paid',payment_method=$2,order_ref=$3 WHERE booking_id=$1 AND payment_status='Pending'", bid, method, ref)
