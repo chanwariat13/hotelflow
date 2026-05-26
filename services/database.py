@@ -47,7 +47,22 @@ async def fetchval(q, *a):
 async def verify_admin_login(username: str, password: str) -> Optional[Dict]:
     row = await fetchrow("SELECT * FROM admin_users WHERE username=$1 AND is_active=TRUE", username)
     if not row: return None
-    return row if verify_password(password, row["password_hash"]) else None
+    if not verify_password(password, row["password_hash"]):
+        return None
+    # Transparent rehash: if the stored hash is the legacy SHA-256 format
+    # (or a weaker PBKDF2 variant), rewrite it with the current parameters
+    # so future logins use the strong KDF without the operator doing
+    # anything. Best-effort — never fail the login over a write error.
+    try:
+        from services.auth import needs_rehash
+        if needs_rehash(row["password_hash"]):
+            await execute(
+                "UPDATE admin_users SET password_hash=$1 WHERE id=$2",
+                hash_password(password), row["id"],
+            )
+    except Exception as e:
+        logger.warning("admin password rehash failed: %s", e)
+    return row
 
 async def update_admin_password(admin_id: int, new_password: str):
     await execute("UPDATE admin_users SET password_hash=$1 WHERE id=$2",
@@ -68,12 +83,22 @@ async def ensure_admin_seed():
 
     Reads from env:
       - ADMIN_USERNAME       (default "admin")
-      - ADMIN_PASSWORD       (default "admin123" — weak, only used if env not set)
+      - ADMIN_PASSWORD       (REQUIRED in non-dev environments — see below)
       - ADMIN_PASSWORD_RESET (truthy = force-reset password on this boot)
+      - ALLOW_DEFAULT_ADMIN_PASSWORD (truthy = permit the weak default —
+        ONLY for local development; never set this in production)
+
+    SECURITY: Previously this function silently seeded the master admin
+    with the literal password "admin123" when ADMIN_PASSWORD was unset,
+    leaving every freshly-deployed instance one guess away from a full
+    superadmin takeover. We now refuse to seed a brand-new account with
+    the weak default unless the operator explicitly opts in via the
+    ALLOW_DEFAULT_ADMIN_PASSWORD escape hatch (matched-keys CI etc.).
 
     Behaviour:
       1. Ensure admin_users table exists.
       2. Create the admin user with env credentials if it doesn't exist.
+         REFUSE if password is the weak default and the escape hatch is off.
       3. Repair the known-broken legacy seed hash to the env password.
       4. If the row currently uses the weak default 'admin123' AND a
          non-default ADMIN_PASSWORD is set in env, auto-upgrade to the env
@@ -86,6 +111,7 @@ async def ensure_admin_seed():
     password = os.getenv("ADMIN_PASSWORD", "admin123")
     force_reset = _truthy(os.getenv("ADMIN_PASSWORD_RESET"))
     is_default_pw = (password == "admin123")
+    allow_default = _truthy(os.getenv("ALLOW_DEFAULT_ADMIN_PASSWORD"))
 
     try:
         await execute("""
@@ -102,14 +128,28 @@ async def ensure_admin_seed():
         row = await fetchrow("SELECT id, password_hash FROM admin_users WHERE username=$1", username)
 
         if not row:
+            if is_default_pw and not allow_default:
+                # Refuse to seed with the well-known default. Operator must
+                # set ADMIN_PASSWORD or explicitly opt in to the weak
+                # default for local development.
+                logger.critical(
+                    "ADMIN_PASSWORD is unset (or still 'admin123') and no admin user exists yet. "
+                    "Refusing to seed the master admin with a weak default password. "
+                    "Set ADMIN_PASSWORD env var to a strong value and redeploy. "
+                    "For local development only, set ALLOW_DEFAULT_ADMIN_PASSWORD=1 to bypass."
+                )
+                raise RuntimeError(
+                    "Refusing to seed master admin with default password. "
+                    "Set ADMIN_PASSWORD."
+                )
             await execute(
                 "INSERT INTO admin_users (username, password_hash, name) VALUES ($1, $2, 'Super Admin')",
                 username, hash_password(password),
             )
             if is_default_pw:
                 logger.warning(
-                    "Seeded default admin '%s' with WEAK password 'admin123'. "
-                    "Set ADMIN_PASSWORD env var to a strong password and redeploy.",
+                    "Seeded admin '%s' with WEAK password 'admin123' — "
+                    "ALLOW_DEFAULT_ADMIN_PASSWORD is set. Do NOT use this in production.",
                     username,
                 )
             else:
@@ -153,8 +193,12 @@ async def ensure_admin_seed():
             )
             return
 
+    except RuntimeError:
+        # Refusal to seed weak password — propagate so the lifespan startup
+        # fails loudly instead of silently coming up with no admin user.
+        raise
     except Exception as e:
-        # Never block startup over the seed; just log it loudly.
+        # Never block startup over a transient DB hiccup; just log loudly.
         logger.exception("ensure_admin_seed failed: %s", e)
 
 
@@ -834,29 +878,48 @@ async def get_hotel_users_by_role(hid: int, role: str) -> List[Dict]:
 
 async def identify_staff_by_whatsapp(phone: str, hotel_id: int) -> Optional[Dict]:
     """Bot calls this to check if incoming WhatsApp number is a staff member.
-    Change their number in DB → bot recognizes new number instantly. No redeploy."""
+    Change their number in DB → bot recognizes new number instantly. No redeploy.
+
+    SECURITY: We deliberately do NOT pull `razorpay_key_id` / `razorpay_secret`
+    here. They were previously in the SELECT and travelled through every bot
+    handler, every log line, and every error trace — one stack trace away
+    from leaking. The Razorpay flow looks them up on demand via
+    `get_razorpay_creds`.
+    """
     return await fetchrow("""
         SELECT hu.*, h.instance_name, h.hotel_name, h.staff_phones,
                h.checkout_hour, h.late_charge_flat, h.max_late_fee,
                h.gotenberg_url, h.google_review_url, h.menu_url,
-               h.payment_mode, h.upi_id, h.upi_display_name,
-               h.razorpay_key_id, h.razorpay_secret
+               h.payment_mode, h.upi_id, h.upi_display_name
         FROM hotel_users hu
         JOIN hotels h ON h.id=hu.hotel_id
         WHERE hu.whatsapp_number=$1 AND hu.hotel_id=$2 AND hu.is_active=TRUE
         LIMIT 1""", phone, hotel_id)
 
 async def identify_any_staff_by_whatsapp(phone: str) -> Optional[Dict]:
-    """Identify staff across ALL hotels by WhatsApp number."""
+    """Identify staff across ALL hotels by WhatsApp number.
+
+    SECURITY: Same as `identify_staff_by_whatsapp` — no Razorpay creds.
+    """
     return await fetchrow("""
         SELECT hu.*, h.slug, h.instance_name, h.hotel_name,
                h.checkout_hour, h.late_charge_flat, h.max_late_fee,
                h.gotenberg_url, h.google_review_url, h.payment_mode,
-               h.upi_id, h.upi_display_name, h.razorpay_key_id, h.razorpay_secret
+               h.upi_id, h.upi_display_name
         FROM hotel_users hu
         JOIN hotels h ON h.id=hu.hotel_id
         WHERE hu.whatsapp_number=$1 AND hu.is_active=TRUE AND h.is_active=TRUE
         LIMIT 1""", phone)
+
+
+async def get_razorpay_creds(hotel_id: int) -> Optional[Dict]:
+    """Return only the Razorpay credentials for this hotel. Called from the
+    payment-link path so the secrets aren't widened across the codebase.
+    """
+    return await fetchrow(
+        "SELECT razorpay_key_id, razorpay_secret FROM hotels WHERE id=$1",
+        hotel_id,
+    )
 
 async def create_hotel_user(hid: int, data: Dict) -> Dict:
     role = data.get("role", "staff")
@@ -914,7 +977,19 @@ async def update_hotel_user(uid: int, data: Dict) -> Optional[Dict]:
 async def verify_hotel_user_login(hid: int, username: str, password: str) -> Optional[Dict]:
     row = await fetchrow("SELECT * FROM hotel_users WHERE hotel_id=$1 AND username=$2 AND is_active=TRUE", hid, username)
     if not row: return None
-    return row if verify_password(password, row["password_hash"]) else None
+    if not verify_password(password, row["password_hash"]):
+        return None
+    # Same transparent rehash as the admin login — see verify_admin_login.
+    try:
+        from services.auth import needs_rehash
+        if needs_rehash(row["password_hash"]):
+            await execute(
+                "UPDATE hotel_users SET password_hash=$1 WHERE id=$2",
+                hash_password(password), row["id"],
+            )
+    except Exception as e:
+        logger.warning("hotel_user password rehash failed: %s", e)
+    return row
 
 async def delete_hotel_user(uid: int):
     await execute("UPDATE hotel_users SET is_active=FALSE WHERE id=$1", uid)
@@ -1021,8 +1096,22 @@ async def get_active_booking_by_room(room: str, hid: int) -> Optional[Dict]:
         WHERE b.room_number=$1 AND b.status='Active' AND b.hotel_id=$2
         GROUP BY b.id LIMIT 1""", room, hid)
 
-async def get_booking_by_id(bid: str) -> Optional[Dict]:
-    return await fetchrow("SELECT * FROM bookings WHERE booking_id=$1", bid)
+async def get_booking_by_id(bid: str, hotel_id: Optional[int] = None) -> Optional[Dict]:
+    """Fetch a booking by id.
+
+    SECURITY: Always pass `hotel_id` from the authenticated request context.
+    Without it the lookup is global, which lets a hotel A user see (and
+    sometimes mutate) bookings belonging to hotel B by passing a guessed
+    booking_id. We log a warning when called unscoped so the remaining
+    legacy callers surface in logs.
+    """
+    if hotel_id is None:
+        logger.warning("get_booking_by_id called without hotel_id (bid=%s)", bid)
+        return await fetchrow("SELECT * FROM bookings WHERE booking_id=$1", bid)
+    return await fetchrow(
+        "SELECT * FROM bookings WHERE booking_id=$1 AND hotel_id=$2",
+        bid, hotel_id,
+    )
 
 async def insert_booking(d: Dict):
     await execute("""
@@ -1171,11 +1260,42 @@ async def get_bookings_list(hid: int, status: str = None, limit: int = 50, offse
 # ══════════════════════════════════════════════════════════════════
 # STAY CHARGES & PAYMENTS
 # ══════════════════════════════════════════════════════════════════
-async def get_charges_for_booking(bid: str) -> List[Dict]:
-    return await fetch("SELECT * FROM stay_charges WHERE booking_id=$1 AND payment_status NOT IN ('Cancelled','Waived') ORDER BY charge_date ASC,id ASC", bid)
+async def get_charges_for_booking(bid: str, hotel_id: Optional[int] = None) -> List[Dict]:
+    """Return non-cancelled stay_charges for a booking.
 
-async def get_balance_due(bid: str) -> float:
-    v = await fetchval("SELECT COALESCE(SUM(total) FILTER(WHERE payment_status='Pending'),0) FROM stay_charges WHERE booking_id=$1", bid)
+    Accepts an optional `hotel_id` to enforce tenant isolation. When omitted
+    we fall back to the legacy global lookup but log a warning — the only
+    safe production path is to pass it.
+    """
+    if hotel_id is None:
+        logger.warning("get_charges_for_booking called without hotel_id (bid=%s)", bid)
+        return await fetch(
+            "SELECT * FROM stay_charges WHERE booking_id=$1 "
+            "AND payment_status NOT IN ('Cancelled','Waived') "
+            "ORDER BY charge_date ASC,id ASC",
+            bid,
+        )
+    return await fetch(
+        "SELECT * FROM stay_charges WHERE booking_id=$1 AND hotel_id=$2 "
+        "AND payment_status NOT IN ('Cancelled','Waived') "
+        "ORDER BY charge_date ASC,id ASC",
+        bid, hotel_id,
+    )
+
+async def get_balance_due(bid: str, hotel_id: Optional[int] = None) -> float:
+    if hotel_id is None:
+        logger.warning("get_balance_due called without hotel_id (bid=%s)", bid)
+        v = await fetchval(
+            "SELECT COALESCE(SUM(total) FILTER(WHERE payment_status='Pending'),0) "
+            "FROM stay_charges WHERE booking_id=$1",
+            bid,
+        )
+    else:
+        v = await fetchval(
+            "SELECT COALESCE(SUM(total) FILTER(WHERE payment_status='Pending'),0) "
+            "FROM stay_charges WHERE booking_id=$1 AND hotel_id=$2",
+            bid, hotel_id,
+        )
     return float(v or 0)
 
 async def insert_stay_charge(d: Dict):
@@ -1228,8 +1348,26 @@ async def insert_stay_charge(d: Dict):
         d.get("payment_status", "Pending"), d.get("order_ref"), d.get("hotel_id", 1),
         hsn, rate, cgst, sgst, igst, bool(inter or False))
 
-async def mark_charges_paid(bid: str, method: str, ref: str):
-    await execute("UPDATE stay_charges SET payment_status='Paid',payment_method=$2,order_ref=$3 WHERE booking_id=$1 AND payment_status='Pending'", bid, method, ref)
+async def mark_charges_paid(bid: str, method: str, ref: str, hotel_id: Optional[int] = None):
+    """Mark all pending charges of a booking as paid.
+
+    Always pass `hotel_id` so a Razorpay webhook for hotel A can't settle a
+    same-`booking_id` row in hotel B (predictable IDs make this trivial —
+    see C3 in the security review).
+    """
+    if hotel_id is None:
+        logger.warning("mark_charges_paid called without hotel_id (bid=%s)", bid)
+        await execute(
+            "UPDATE stay_charges SET payment_status='Paid',payment_method=$2,order_ref=$3 "
+            "WHERE booking_id=$1 AND payment_status='Pending'",
+            bid, method, ref,
+        )
+        return
+    await execute(
+        "UPDATE stay_charges SET payment_status='Paid',payment_method=$2,order_ref=$3 "
+        "WHERE booking_id=$1 AND payment_status='Pending' AND hotel_id=$4",
+        bid, method, ref, hotel_id,
+    )
 
 async def insert_payment_log(d: Dict):
     await execute("""
@@ -1262,8 +1400,31 @@ async def insert_service_request(d: Dict):
         d["request_id"],bid,d["service_name"],d["category"],
         d.get("note",""),d["department"],d.get("price",0))
 
-async def mark_service_done(rid: str) -> Optional[Dict]:
-    return await fetchrow("UPDATE service_requests SET status='Completed',completed_at=NOW() WHERE request_id=$1 RETURNING *", rid)
+async def mark_service_done(rid: str, hotel_id: Optional[int] = None) -> Optional[Dict]:
+    """Mark a service request completed.
+
+    `service_requests` already has a `hotel_id` column populated by the
+    insert path, so scoping is a one-line addition here. Without it, a
+    staff member at hotel A can mark hotel B's tickets done by passing
+    a guessed `request_id`.
+    """
+    if hotel_id is None:
+        logger.warning("mark_service_done called without hotel_id (rid=%s)", rid)
+        return await fetchrow(
+            "UPDATE service_requests SET status='Completed',completed_at=NOW() "
+            "WHERE request_id=$1 RETURNING *",
+            rid,
+        )
+    # service_requests doesn't carry hotel_id directly — derive it from the
+    # linked booking. Anything that doesn't link to a booking in this hotel
+    # is treated as out-of-tenant and refused.
+    return await fetchrow(
+        "UPDATE service_requests sr SET status='Completed', completed_at=NOW() "
+        "FROM bookings b "
+        "WHERE sr.request_id=$1 AND sr.booking_id=b.booking_id AND b.hotel_id=$2 "
+        "RETURNING sr.*",
+        rid, hotel_id,
+    )
 
 async def get_pending_service_requests(hid: int) -> List[Dict]:
     return await fetch("""
@@ -1323,7 +1484,23 @@ async def get_today_checkouts(hid: int) -> List[Dict]:
 async def get_active_guests_for_broadcast(hid: int) -> List[Dict]:
     return await fetch("SELECT guest_phone,guest_name,room_number FROM bookings WHERE status='Active' AND hotel_id=$1", hid)
 
-async def lookup_guest_by_phone(phone: str) -> Optional[Dict]:
+async def lookup_guest_by_phone(phone: str, hotel_id: Optional[int] = None) -> Optional[Dict]:
+    """Look up guest history by phone.
+
+    Add a `hotel_id` filter when the caller has a tenant context — without
+    it, hotel A staff can pull guest profiles (name, ID type, ID number,
+    photo URLs, total_spent, last_checkin) for hotel B's guests.
+    """
+    if hotel_id is None:
+        logger.warning("lookup_guest_by_phone called without hotel_id (phone=%s)", phone)
+        return await fetchrow("""
+            SELECT b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
+              b.id_proof_photo,b.id_proof_photo_back,b.guest_count,
+              COUNT(*) OVER() AS total_visits,
+              COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Paid'),0) AS total_spent,
+              MAX(b.checkin_date) AS last_checkin
+            FROM bookings b LEFT JOIN stay_charges sc ON sc.booking_id=b.booking_id
+            WHERE b.guest_phone=$1 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""", phone)
     return await fetchrow("""
         SELECT b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
           b.id_proof_photo,b.id_proof_photo_back,b.guest_count,
@@ -1331,13 +1508,22 @@ async def lookup_guest_by_phone(phone: str) -> Optional[Dict]:
           COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Paid'),0) AS total_spent,
           MAX(b.checkin_date) AS last_checkin
         FROM bookings b LEFT JOIN stay_charges sc ON sc.booking_id=b.booking_id
-        WHERE b.guest_phone=$1 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""", phone)
+        WHERE b.guest_phone=$1 AND b.hotel_id=$2 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""",
+        phone, hotel_id)
 
-async def lookup_guest_by_id(id_num: str) -> Optional[Dict]:
+async def lookup_guest_by_id(id_num: str, hotel_id: Optional[int] = None) -> Optional[Dict]:
+    """Same as lookup_guest_by_phone but keyed by ID-proof number."""
+    if hotel_id is None:
+        logger.warning("lookup_guest_by_id called without hotel_id (id_num=%s)", id_num)
+        return await fetchrow("""
+            SELECT b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
+              b.id_proof_photo,b.id_proof_photo_back,b.guest_count,MAX(b.checkin_date) AS last_checkin
+            FROM bookings b WHERE b.id_proof_number=$1 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""", id_num)
     return await fetchrow("""
         SELECT b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
           b.id_proof_photo,b.id_proof_photo_back,b.guest_count,MAX(b.checkin_date) AS last_checkin
-        FROM bookings b WHERE b.id_proof_number=$1 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""", id_num)
+        FROM bookings b WHERE b.id_proof_number=$1 AND b.hotel_id=$2 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""",
+        id_num, hotel_id)
 
 async def get_monthly_stats(hid: int) -> Dict:
     return await fetchrow("""

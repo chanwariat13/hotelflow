@@ -101,7 +101,7 @@ async def list_all(slug: str,
 @router.get("/{slug}/booking/{booking_id}/xml")
 async def export_xml(slug: str, booking_id: str):
     h = await _get_hotel_or_404(slug)
-    b = await db.get_booking_by_id(booking_id)
+    b = await db.get_booking_by_id(booking_id, hotel_id=h["id"])
     if not b or b.get("hotel_id") != h["id"]:
         raise HTTPException(404, "Booking not found for this hotel")
     if not b.get("is_foreign_guest"):
@@ -117,7 +117,7 @@ async def export_xml(slug: str, booking_id: str):
 @router.get("/{slug}/booking/{booking_id}/csv")
 async def export_single_csv(slug: str, booking_id: str):
     h = await _get_hotel_or_404(slug)
-    b = await db.get_booking_by_id(booking_id)
+    b = await db.get_booking_by_id(booking_id, hotel_id=h["id"])
     if not b or b.get("hotel_id") != h["id"]:
         raise HTTPException(404, "Booking not found for this hotel")
     if not b.get("is_foreign_guest"):
@@ -181,7 +181,7 @@ class ForeignFieldsBody(BaseModel):
 @router.put("/{slug}/booking/{booking_id}")
 async def update_foreign(slug: str, booking_id: str, body: ForeignFieldsBody, request: Request):
     h = await _get_hotel_or_404(slug)
-    existing = await db.get_booking_by_id(booking_id)
+    existing = await db.get_booking_by_id(booking_id, hotel_id=h["id"])
     if not existing or existing.get("hotel_id") != h["id"]:
         raise HTTPException(404, "Booking not found for this hotel")
     payload = {k: v for k, v in body.dict().items() if v is not None}
@@ -206,7 +206,7 @@ class MarkFiledBody(BaseModel):
 @router.post("/{slug}/booking/{booking_id}/mark_filed")
 async def mark_filed(slug: str, booking_id: str, body: MarkFiledBody):
     h = await _get_hotel_or_404(slug)
-    existing = await db.get_booking_by_id(booking_id)
+    existing = await db.get_booking_by_id(booking_id, hotel_id=h["id"])
     if not existing or existing.get("hotel_id") != h["id"]:
         raise HTTPException(404, "Booking not found for this hotel")
     if not existing.get("is_foreign_guest"):

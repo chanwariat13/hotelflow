@@ -260,7 +260,7 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # DONE <SR_ID>
     m = re.match(r"^DONE\s+(SR\w+)$", UP)
     if m:
-        row = await db.mark_service_done(m.group(1))
+        row = await db.mark_service_done(m.group(1), hotel_id=hid)
         if row: await send_text(instance, phone, f"✅ {m.group(1)} marked DONE!\n🛎️ {row.get('service_name','')}")
         else: await send_text(instance, phone, f"⚠️ Request {m.group(1)} not found.")
         return
@@ -269,10 +269,10 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     m = re.match(r"^EXTEND\s+CONFIRM\s+(\w+)\s+(\d{4}-\d{2}-\d{2})$", UP)
     if m:
         bid, new_date = m.group(1), m.group(2)
-        bk = await db.get_booking_by_id(bid)
+        bk = await db.get_booking_by_id(bid, hotel_id=hid)
         if bk:
-            await db.execute("UPDATE bookings SET checkout_date=$1,updated_at=NOW() WHERE booking_id=$2",
-                             datetime.strptime(new_date,"%Y-%m-%d"), bid)
+            await db.execute("UPDATE bookings SET checkout_date=$1,updated_at=NOW() WHERE booking_id=$2 AND hotel_id=$3",
+                             datetime.strptime(new_date,"%Y-%m-%d"), bid, hid)
             sess = await get_session(bk["guest_phone"])
             if sess:
                 sess["checkoutDate"] = new_date
@@ -425,7 +425,7 @@ async def handle_guest(phone, text, UP, session, hotel, instance, hid, h_name,
         bk = await db.get_active_booking_by_room(room, hid)
         if not bk:
             await send_text(instance, phone, "⚠️ No active booking. Contact reception."); return
-        charges = await db.get_charges_for_booking(bid)
+        charges = await db.get_charges_for_booking(bid, hotel_id=hid)
         total = sum(float(c.get("total",0)) for c in charges)
         paid  = sum(float(c.get("total",0)) for c in charges if c.get("payment_status")=="Paid")
         pend  = total - paid
@@ -462,7 +462,7 @@ async def handle_guest(phone, text, UP, session, hotel, instance, hid, h_name,
 
     # PAY CASH
     if any(UP.startswith(k) for k in ("PAY CASH","CASH","CASH PAYMENT")):
-        bal = await db.get_balance_due(bid)
+        bal = await db.get_balance_due(bid, hotel_id=hid)
         staff_phones = await db.get_staff_phones(hid)
         await send_to_phones(instance, staff_phones,
             f"💵 *CASH PAYMENT — COLLECT NOW*\n━━━━━━━━━━━━━━━━━━\n"
@@ -481,7 +481,7 @@ async def handle_guest(phone, text, UP, session, hotel, instance, hid, h_name,
             new_dt = old_dt + timedelta(days=1)
             new_date = new_dt.strftime("%Y-%m-%d")
         except: new_date = co_date
-        bk = await db.get_booking_by_id(bid)
+        bk = await db.get_booking_by_id(bid, hotel_id=hid)
         await send_to_phones(instance, staff_phones,
             f"🔔 *STAY EXTENSION REQUEST*\n━━━━━━━━━━━━━━━━━━\n"
             f"👤 {name}\n📱 {phone}\n🏨 Room: *{room}*\n🔖 {bid}\n\n"
@@ -547,7 +547,7 @@ async def approve_guest(target, staff_phone, hotel, instance, hid, h_name):
 async def do_checkout(bk, hotel, instance, review_url, checkout_h, late_flat, hid, gotenberg, staff_phones):
     phone = bk["guest_phone"]; room = bk["room_number"]; bid = bk["booking_id"]; name = bk["guest_name"]
     h_name = hotel["hotel_name"]
-    bal = await db.get_balance_due(bid)
+    bal = await db.get_balance_due(bid, hotel_id=hid)
     now = datetime.now(IST)
     co_str = str(bk.get("checkout_date","")).split("T")[0]
     try:
@@ -570,7 +570,7 @@ async def do_checkout(bk, hotel, instance, review_url, checkout_h, late_flat, hi
         return
     await db.checkout_booking(room, hid)
     await delete_session(phone); await delete_room(room); await delete_pending(phone)
-    charges = await db.get_charges_for_booking(bid)
+    charges = await db.get_charges_for_booking(bid, hotel_id=hid)
     bill_h = build_bill_html(bk, charges, hotel)
     pdf = await html_to_pdf_b64(bill_h, gotenberg)
     if pdf: await send_media_b64(instance, phone, pdf, f"📄 Bill from {h_name}", "document", f"bill_{room}.pdf")
@@ -596,12 +596,12 @@ async def process_cash(target, staff_phone, hotel, instance, hid):
     sess = await get_session(target)
     if not sess: await send_text(instance, staff_phone, f"⚠️ No session for {target}"); return
     bid = sess.get("bookingId",""); room = sess.get("room",""); name = sess.get("name","Guest")
-    bal = await db.get_balance_due(bid)
+    bal = await db.get_balance_due(bid, hotel_id=hid)
     if bal <= 0: await send_text(instance, staff_phone, f"ℹ️ No dues for {name} Room {room}"); return
-    await db.mark_charges_paid(bid, "Cash", "CASH RECEIVED")
+    await db.mark_charges_paid(bid, "Cash", "CASH RECEIVED", hotel_id=hid)
     await db.insert_payment_log({"booking_id":bid,"guest_phone":target,"room_number":room,
         "guest_name":name,"amount":bal,"payment_method":"Cash","hotel_id":hid})
-    await db.execute("UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2", bal, bid)
+    await db.execute("UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2 AND hotel_id=$3", bal, bid, hid)
     await send_text(instance, staff_phone, f"✅ Cash ₹{bal:.0f} recorded\n👤 {name} · Room {room}")
     await send_text(instance, target, f"✅ *Cash Payment Confirmed!*\n💰 ₹{bal:.0f} received\n🏨 Room: {room}\nThank you! 🙏")
 
@@ -609,17 +609,22 @@ async def confirm_payment(room, amount, staff_phone, hotel, instance, hid):
     bk = await db.get_active_booking_by_room(room, hid)
     if not bk: await send_text(instance, staff_phone, f"⚠️ No active booking for Room {room}"); return
     bid = bk["booking_id"]; phone = bk["guest_phone"]; name = bk["guest_name"]
-    await db.mark_charges_paid(bid, "Online", "PAY CONFIRM")
+    await db.mark_charges_paid(bid, "Online", "PAY CONFIRM", hotel_id=hid)
     await db.insert_payment_log({"booking_id":bid,"guest_phone":phone,"room_number":room,
         "guest_name":name,"amount":amount,"payment_method":"Online","hotel_id":hid})
-    await db.execute("UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2", amount, bid)
+    await db.execute("UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2 AND hotel_id=$3", amount, bid, hid)
     await send_text(instance, staff_phone, f"✅ ₹{amount:.0f} confirmed · Room {room}")
     await send_text(instance, phone, f"✅ *Payment Confirmed!*\n💰 ₹{amount:.0f} recorded.\nThank you! 🙏")
 
 async def do_razorpay(phone, room, bid, name, hotel, instance, hid):
-    bal = await db.get_balance_due(bid)
+    bal = await db.get_balance_due(bid, hotel_id=hid)
     if bal <= 0: await send_text(instance, phone, "✅ No pending dues!"); return
-    key_id = hotel.get("razorpay_key_id",""); secret = hotel.get("razorpay_secret","")
+    # Razorpay credentials are no longer carried on the `hotel` dict from
+    # `identify_staff_by_whatsapp`; fetch them on demand to keep the secret
+    # blast radius small (one stack trace away from being logged otherwise).
+    creds = await db.get_razorpay_creds(hid) or {}
+    key_id = creds.get("razorpay_key_id", "") or ""
+    secret = creds.get("razorpay_secret", "") or ""
     if not key_id: await send_text(instance, phone, "⚠️ Online payment not configured. Please pay cash or UPI."); return
     link = await create_razorpay_link(key_id, secret, bal, f"Hotel Stay - Room {room} - {bid}", phone)
     if link:
@@ -630,7 +635,7 @@ async def do_razorpay(phone, room, bid, name, hotel, instance, hid):
         await send_text(instance, phone, "⚠️ Could not generate link. Please contact reception.")
 
 async def do_upi(phone, room, bid, name, hotel, instance, hid):
-    bal = await db.get_balance_due(bid)
+    bal = await db.get_balance_due(bid, hotel_id=hid)
     if bal <= 0: await send_text(instance, phone, "✅ No pending dues!"); return
     upi_id = hotel.get("upi_id",""); upi_name = hotel.get("upi_display_name","") or hotel.get("hotel_name","Hotel")
     if not upi_id: await send_text(instance, phone, "⚠️ UPI not configured. Please pay cash."); return
@@ -670,15 +675,64 @@ async def do_service_request(phone, text, room, bid, name, hotel, instance, hid)
         f"Our team will attend shortly. 🙏\n{'💰 ₹'+str(int(price))+' added to bill.' if price>0 else ''}")
 
 async def send_bill(bk, hotel, instance, gotenberg):
-    charges = await db.get_charges_for_booking(bk["booking_id"])
+    # `bk` came from get_booking_by_id / get_active_booking_by_room — both
+    # populate `hotel_id` from the row. Pull it through into the charges
+    # query so we never serve cross-tenant charges into the bill.
+    hid = bk.get("hotel_id") or hotel.get("id")
+    charges = await db.get_charges_for_booking(bk["booking_id"], hotel_id=hid)
     pdf = await html_to_pdf_b64(build_bill_html(bk, charges, hotel), gotenberg)
     if pdf:
         await send_media_b64(instance, bk["guest_phone"], pdf,
                               f"📄 Bill — Room {bk['room_number']}", "document", f"bill_{bk['room_number']}.pdf")
 
 # ── Webhook entry point ────────────────────────────────────────────
+# Shared secret used to authenticate incoming Evolution API webhooks. We
+# compare it constant-time against the `apikey` header that Evolution
+# already sends (configured in your Evolution instance), or any explicit
+# WEBHOOK_HMAC_SECRET if you front the API with a custom proxy.
+#
+# When `WEBHOOK_API_KEY` is unset we fall back to `EVOLUTION_API_KEY` —
+# Evolution itself uses that header for its outbound calls, so most
+# deployments will already have the value handy. As long as either env
+# is set, we reject any unauthenticated webhook hit.
+import hmac as _hmac
+import os as _os
+from config.settings import EVOLUTION_API_KEY as _EVO_KEY
+_WEBHOOK_KEY = (
+    _os.getenv("WEBHOOK_API_KEY") or _os.getenv("EVOLUTION_API_KEY") or _EVO_KEY or ""
+).strip()
+
+
+def _check_webhook_auth(request: Request) -> bool:
+    """True iff the request bears a valid shared secret.
+
+    Without this, anyone who knows the public webhook URL can post a
+    forged `messages.upsert` body with their phone matching a staff
+    `whatsapp_number`, then fire APPROVE / REJECT / CASH RECEIVED /
+    PAY CONFIRM / FREE / CHECKOUT / BLOCK / UNBLOCK on any hotel.
+    """
+    if not _WEBHOOK_KEY:
+        # Operator hasn't rotated yet; log loudly but don't block. As soon
+        # as WEBHOOK_API_KEY (or EVOLUTION_API_KEY) is set, the route locks
+        # down. This matches the gradual-migration approach used elsewhere
+        # in this PR.
+        logger.warning(
+            "WhatsApp webhook accepted without auth — set WEBHOOK_API_KEY (or "
+            "EVOLUTION_API_KEY) env var to enable signature verification."
+        )
+        return True
+    provided = (request.headers.get("apikey") or
+                request.headers.get("x-api-key") or
+                request.headers.get("X-Webhook-Key") or "").strip()
+    if not provided:
+        return False
+    return _hmac.compare_digest(provided.encode("utf-8"), _WEBHOOK_KEY.encode("utf-8"))
+
+
 @router.post("/webhook/whatsapp")
 async def webhook(request: Request, bg: BackgroundTasks):
+    if not _check_webhook_auth(request):
+        return JSONResponse({"status": "unauthorized"}, status_code=401)
     try: body = await request.json()
     except: return JSONResponse({"status":"ok"})
     instance = (body.get("instance") or body.get("instanceName") or

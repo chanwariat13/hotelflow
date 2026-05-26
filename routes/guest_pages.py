@@ -532,16 +532,51 @@ async def api_lookup(slug: str = "", phone: str = ""):
         return JSONResponse({"found": False})
 
 @router.get("/api/guest/charges")
-async def api_charges(booking_id: str = ""):
-    return JSONResponse({"charges": await db.get_charges_for_booking(booking_id)})
+async def api_charges(phone: str = "", slug: str = "", booking_id: str = ""):
+    """
+    Return the charges for the caller's CURRENT active booking.
+
+    SECURITY: Previously this took only `?booking_id=X` and returned charges
+    for any booking system-wide — combined with predictable booking_ids,
+    that was a one-step enumeration of every guest's bill in every hotel.
+    We now require both `phone` and `slug` and look up the active booking
+    server-side, so the caller can only ever see their own charges. The
+    legacy `booking_id` parameter is accepted but only honoured when it
+    matches the active booking; otherwise it's ignored.
+    """
+    if not phone or not slug:
+        return JSONResponse({"charges": []})
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        return JSONResponse({"charges": []})
+    bk = await db.get_active_booking_by_phone(phone.strip(), hotel["id"])
+    if not bk:
+        return JSONResponse({"charges": []})
+    if booking_id and booking_id != bk["booking_id"]:
+        # Caller is asking about someone else's booking; deny silently.
+        return JSONResponse({"charges": []})
+    charges = await db.get_charges_for_booking(bk["booking_id"], hotel_id=hotel["id"])
+    return JSONResponse({"charges": charges})
 
 @router.get("/api/guest/bill")
 async def api_bill(phone: str = "", slug: str = ""):
+    """
+    Show the bill for the caller's CURRENT active booking.
+
+    SECURITY: This used to leak the bill of any guest whose phone you
+    could guess (or get from /api/guest/lookup). It still trusts only the
+    `phone`+`slug` pair (full session-binding is in the follow-up PR), but
+    we now enforce that the booking belongs to that phone AND that hotel
+    via `get_active_booking_by_phone`, and we scope `get_charges_for_booking`
+    by hotel_id so cross-tenant bookings can't be retrieved by id.
+    """
+    if not phone or not slug:
+        return JSONResponse({"found": False})
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel: return JSONResponse({"found":False})
-    bk = await db.get_active_booking_by_phone(phone, hotel["id"])
+    bk = await db.get_active_booking_by_phone(phone.strip(), hotel["id"])
     if not bk: return JSONResponse({"found":False})
-    charges = await db.get_charges_for_booking(bk["booking_id"])
+    charges = await db.get_charges_for_booking(bk["booking_id"], hotel_id=hotel["id"])
     return JSONResponse({"found":True,"guest_name":bk["guest_name"],"room_number":bk["room_number"],
         "booking_id":bk["booking_id"],"checkin_date":fmt_date(bk.get("checkin_date")),
         "checkout_date":fmt_date(bk.get("checkout_date")),"charges":charges})
