@@ -89,6 +89,9 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02
   <div class="ni" id="ni-svc" onclick="nav('svc')">🍽️ Services & Prices</div>
   <div class="ni" id="ni-staff" onclick="nav('staff')">👥 Staff & Users</div>
   <div class="ni" id="ni-settings" onclick="nav('settings')">⚙️ Hotel Settings</div>
+  <div class="slbl">Insights</div>
+  <div class="ni" id="ni-reports" onclick="nav('reports')">📈 Reports & KPIs</div>
+  <div class="ni" id="ni-channel" onclick="nav('channel')">🌐 OTA Channels</div>
   <div class="slbl">Actions</div>
   <div class="ni" id="ni-bc" onclick="nav('bc')">📢 Broadcast</div>
   <div class="sb-footer">
@@ -284,6 +287,98 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02
   </div>
 </div>
 
+<!-- REPORTS & KPIs -->
+<div id="pg-reports" class="pg">
+  <h2 class="ptitle">📈 Reports & KPIs</h2>
+  <div id="repNo" style="display:none" class="fsec">
+    <p style="color:var(--t2)">You don't have permission to view revenue data. Ask your owner to enable it.</p>
+  </div>
+  <div id="repBody">
+    <div class="fsec">
+      <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+        <div class="fg" style="margin:0"><label>From</label><input type="date" id="repFrom"></div>
+        <div class="fg" style="margin:0"><label>To</label><input type="date" id="repTo"></div>
+        <button class="btn bg" onclick="lReports()">Refresh</button>
+        <button class="btn bgh" onclick="runNightAudit()" id="repRunBtn" style="display:none">▶ Run night audit</button>
+        <span id="repWindow" style="color:var(--t2);font-size:12px;margin-left:auto"></span>
+      </div>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="cl">Avg Occupancy</div><div class="cv gld" id="repOcc">—</div><div class="cs">window avg</div></div>
+      <div class="card"><div class="cl">ADR</div><div class="cv" id="repAdr">—</div><div class="cs">avg daily rate</div></div>
+      <div class="card"><div class="cl">RevPAR</div><div class="cv grn" id="repRevpar">—</div><div class="cs">revenue / room</div></div>
+      <div class="card"><div class="cl">TRevPAR</div><div class="cv grn" id="repTrevpar">—</div><div class="cs">total / room</div></div>
+      <div class="card"><div class="cl">Room Revenue</div><div class="cv gld" id="repRoomRev">—</div><div class="cs">window total</div></div>
+      <div class="card"><div class="cl">Total Revenue</div><div class="cv gld" id="repTotRev">—</div><div class="cs">window total</div></div>
+    </div>
+    <div class="fsec">
+      <div class="ft">Daily RevPAR</div>
+      <div class="bwrap" id="repBars" style="height:140px"></div>
+      <div style="font-size:11px;color:var(--t2)">Bars scale to highest day in the window.</div>
+    </div>
+    <div class="fsec">
+      <div class="ft">Revenue mix</div>
+      <div id="repSegments" style="font-size:13px">Loading…</div>
+    </div>
+    <div class="fsec">
+      <div class="ft">Booking source</div>
+      <div id="repSource" style="font-size:13px">Loading…</div>
+    </div>
+    <div class="fsec">
+      <div class="ft">Recent night audits</div>
+      <div class="tw"><table>
+        <thead><tr><th>Date</th><th>Status</th><th>Occ</th><th>ADR</th><th>RevPAR</th><th>Revenue</th><th>Postings</th><th>Run by</th></tr></thead>
+        <tbody id="repAuditTbody"><tr><td colspan="8" style="text-align:center;color:var(--t2)">Loading…</td></tr></tbody>
+      </table></div>
+    </div>
+  </div>
+</div>
+
+<!-- OTA CHANNELS -->
+<div id="pg-channel" class="pg">
+  <h2 class="ptitle">🌐 OTA Channels</h2>
+  <div id="chNoPerm" style="display:none" class="fsec">
+    <p style="color:var(--t2)">You don't have permission to manage channels. Owner access required.</p>
+  </div>
+  <div id="chBody">
+    <div class="fsec">
+      <div class="ft">Connection</div>
+      <div id="chAccount" style="font-size:13px">Loading…</div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+        <button class="btn bg" onclick="openChConnect()">⚙️ Connect / Update</button>
+        <button class="btn bgh" onclick="syncInv()" id="chSyncInvBtn" style="display:none">▶ Push inventory</button>
+        <button class="btn bgh" onclick="syncBookings()" id="chSyncBkBtn" style="display:none">▶ Pull bookings</button>
+        <button class="btn brd" onclick="disconnectCh()" id="chDiscBtn" style="display:none">Disconnect</button>
+      </div>
+    </div>
+    <div class="fsec">
+      <div class="ft">Room-type mapping</div>
+      <div style="margin-bottom:10px">
+        <button class="btn bg bsm" onclick="openAddRT()">+ Add mapping</button>
+        <span style="color:var(--t2);font-size:12px;margin-left:8px">Map your room_type → the aggregator's room-type code (DLX, STD, …)</span>
+      </div>
+      <div class="tw"><table>
+        <thead><tr><th>Provider Code</th><th>Internal type</th><th>Label</th><th>Units</th><th>Base rate</th><th>Active</th><th></th></tr></thead>
+        <tbody id="chRtTbody"><tr><td colspan="7" style="text-align:center;color:var(--t2)">No room types mapped yet.</td></tr></tbody>
+      </table></div>
+    </div>
+    <div class="fsec">
+      <div class="ft">OTA reservations</div>
+      <div class="tw"><table>
+        <thead><tr><th>Source</th><th>Ref</th><th>Guest</th><th>Check-in</th><th>Check-out</th><th>Total</th><th>Status</th><th></th></tr></thead>
+        <tbody id="chBkTbody"><tr><td colspan="8" style="text-align:center;color:var(--t2)">No reservations yet.</td></tr></tbody>
+      </table></div>
+    </div>
+    <div class="fsec">
+      <div class="ft">Recent sync log</div>
+      <div class="tw"><table>
+        <thead><tr><th>Time</th><th>Operation</th><th>Status</th><th>Records</th><th>Notes</th></tr></thead>
+        <tbody id="chLogTbody"><tr><td colspan="5" style="text-align:center;color:var(--t2)">No sync events yet.</td></tr></tbody>
+      </table></div>
+    </div>
+  </div>
+</div>
+
 </main>
 
 <!-- Modal -->
@@ -314,6 +409,7 @@ async function lp(p){
   if(p==='dash')lDash();else if(p==='rooms')lRooms();else if(p==='bk')lBk();
   else if(p==='rev')lRev();else if(p==='sr')lSR();else if(p==='svc')lSvc();
   else if(p==='staff')lStaff();else if(p==='settings')lSet();
+  else if(p==='reports')lReports();else if(p==='channel')lChannel();
 }
 function toast(m,t='ok'){const e=document.getElementById('toast');e.textContent=m;e.className='toast show t'+t;setTimeout(()=>e.className='toast',3000);}
 async function api(path,method='GET',body=null){
@@ -333,10 +429,10 @@ async function init(){
   document.getElementById('sbName').textContent='🏨 '+slug.replace(/-/g,' ').replace(/\b\w/g,c=>c.toUpperCase());
   document.getElementById('sbRole').textContent=(d.user_role||d.role||'').toUpperCase();
   document.getElementById('sbUser').textContent=d.name||'User';
-  if(!d.can_view_revenue){document.getElementById('ni-rev').style.display='none';}
+  if(!d.can_view_revenue){document.getElementById('ni-rev').style.display='none';document.getElementById('ni-reports').style.display='none';}
   if(!d.can_manage_services){document.getElementById('ni-svc').style.display='none';}
   if(!d.can_manage_staff){document.getElementById('ni-staff').style.display='none';}
-  if(!d.can_edit_hotel){document.getElementById('ni-settings').style.display='none';}
+  if(!d.can_edit_hotel){document.getElementById('ni-settings').style.display='none';document.getElementById('ni-channel').style.display='none';}
   if(!d.can_broadcast){document.getElementById('ni-bc').style.display='none';}
   if(d.can_broadcast){document.getElementById('bc-btn').style.display='inline-flex';}
   lDash();
@@ -593,6 +689,235 @@ async function sendBC(){
 }
 
 async function logout(){await fetch('/auth/logout',{method:'POST'});window.location.href='/login?slug='+slug;}
+
+// ── Reports & KPIs ─────────────────────────────────────────────
+function _todayISO(d){const x=d||new Date();return x.toISOString().slice(0,10);}
+function _daysAgo(n){const d=new Date();d.setDate(d.getDate()-n);return _todayISO(d);}
+function _ensureRepDates(){
+  const t=document.getElementById('repTo'),f=document.getElementById('repFrom');
+  if(!t.value)t.value=_todayISO();
+  if(!f.value)f.value=_daysAgo(29);
+  return {from:f.value,to:t.value};
+}
+async function lReports(){
+  if(!U.can_view_revenue){
+    document.getElementById('repNo').style.display='block';
+    document.getElementById('repBody').style.display='none';return;
+  }
+  if(U.can_edit_hotel)document.getElementById('repRunBtn').style.display='inline-flex';
+  const {from,to}=_ensureRepDates();
+  document.getElementById('repWindow').textContent=from+' → '+to;
+
+  const kpi=await api('/api/hotel/'+slug+'/reports/kpi?from='+from+'&to='+to);
+  if(kpi&&kpi.rollup){
+    const r=kpi.rollup;
+    document.getElementById('repOcc').textContent=(r.avg_occupancy_pct||0).toFixed(1)+'%';
+    document.getElementById('repAdr').textContent=inr(r.avg_adr);
+    document.getElementById('repRevpar').textContent=inr(r.avg_revpar);
+    document.getElementById('repTrevpar').textContent=inr(r.avg_trevpar);
+    document.getElementById('repRoomRev').textContent=inr(r.sum_room_revenue);
+    document.getElementById('repTotRev').textContent=inr(r.sum_total_revenue);
+    const series=kpi.series||[];
+    const max=Math.max(1,...series.map(x=>+x.revpar||0));
+    document.getElementById('repBars').innerHTML=series.slice(-30).map(x=>{
+      const h=Math.max(3,Math.round(((+x.revpar||0)/max)*120));
+      const lbl=(x.date||'').slice(5);
+      return `<div class="bg2"><div class="bval">${(+x.revpar||0).toFixed(0)}</div><div class="bar" style="height:${h}px"></div><div class="bl2">${lbl}</div></div>`;
+    }).join('') || '<div style="color:var(--t2);font-size:12px">No data in window.</div>';
+  }
+
+  const seg=await api('/api/hotel/'+slug+'/reports/segments?from='+from+'&to='+to);
+  if(seg&&seg.segments){
+    document.getElementById('repSegments').innerHTML = seg.segments.length
+      ? seg.segments.map(s=>{
+          const pct=(s.percent||0).toFixed(1);
+          return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><div style="flex:0 0 130px"><span class="tag">${s.service_type}</span></div><div style="flex:1;background:var(--s2);height:8px;border-radius:4px;overflow:hidden"><div style="background:var(--gd);height:100%;width:${pct}%"></div></div><div style="flex:0 0 90px;text-align:right">${inr(s.amount)}</div><div style="flex:0 0 50px;text-align:right;color:var(--t2)">${pct}%</div></div>`;
+        }).join('')
+      : '<div style="color:var(--t2)">No revenue rows in window.</div>';
+  }
+
+  const src=await api('/api/hotel/'+slug+'/reports/source-mix?from='+from+'&to='+to);
+  if(src&&src.sources){
+    document.getElementById('repSource').innerHTML = src.sources.length
+      ? src.sources.map(s=>{
+          const pct=(s.percent||0).toFixed(1);
+          return `<div style="display:flex;align-items:center;gap:8px;margin:4px 0"><div style="flex:0 0 130px"><span class="tag">${s.source||'direct'}</span></div><div style="flex:1;background:var(--s2);height:8px;border-radius:4px;overflow:hidden"><div style="background:#79c0ff;height:100%;width:${pct}%"></div></div><div style="flex:0 0 90px;text-align:right">${s.bookings} bk</div><div style="flex:0 0 80px;text-align:right;color:var(--t2)">${s.room_nights} nights</div></div>`;
+        }).join('')
+      : '<div style="color:var(--t2)">No bookings in window.</div>';
+  }
+
+  const audits=await api('/api/hotel/'+slug+'/reports/night-audits?from='+from+'&to='+to);
+  const tb=document.getElementById('repAuditTbody');
+  if(audits&&audits.audits&&audits.audits.length){
+    tb.innerHTML=audits.audits.map(a=>{
+      const st=a.status||'completed';
+      const cls=st==='completed'?'ba':(st==='failed'?'bo':'bc');
+      const date=String(a.audit_date||'').slice(0,10);
+      return `<tr><td><b>${date}</b></td><td><span class="bdg ${cls}">${st}</span></td><td>${(+a.occupancy_pct||0).toFixed(1)}%</td><td>${inr(a.adr)}</td><td>${inr(a.revpar)}</td><td>${inr(a.total_revenue)}</td><td>+${a.rent_postings_added||0} / skip ${a.rent_postings_skipped||0}</td><td style="color:var(--t2);font-size:12px">${a.run_by||'—'}</td></tr>`;
+    }).join('');
+  } else {
+    tb.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--t2)">No audits in this window. Run one or wait for the nightly job.</td></tr>';
+  }
+}
+async function runNightAudit(){
+  if(!confirm('Run the night audit now? This auto-posts room rent for in-house guests.'))return;
+  const r=await api('/api/hotel/'+slug+'/reports/night-audit/run','POST',{});
+  if(r&&r.success){toast('Night audit complete');lReports();}else toast('Failed','er');
+}
+
+// ── OTA Channels ────────────────────────────────────────────────
+function _channelStatusLabel(a){
+  if(!a)return '<span style="color:var(--t2)">Not connected</span>';
+  const dry=a.dry_run?' <span class="bdg bc">dry-run</span>':'';
+  const act=a.is_active?'<span class="bdg ba">active</span>':'<span class="bdg bo">inactive</span>';
+  return `<b>${a.provider||'—'}</b> · code <code style="font-family:monospace">${a.hotel_code||'(unset)'}</code> ${act}${dry}`+
+         (a.last_inventory_push_at?`<div style="color:var(--t2);font-size:12px;margin-top:4px">Last inventory push: ${new Date(a.last_inventory_push_at).toLocaleString()}</div>`:'')+
+         (a.last_booking_pull_at?`<div style="color:var(--t2);font-size:12px">Last booking pull: ${new Date(a.last_booking_pull_at).toLocaleString()}</div>`:'')+
+         (a.last_error?`<div style="color:#f85149;font-size:12px;margin-top:4px">Last error: ${a.last_error}</div>`:'');
+}
+async function lChannel(){
+  if(!U.can_edit_hotel){
+    document.getElementById('chNoPerm').style.display='block';
+    document.getElementById('chBody').style.display='none';return;
+  }
+  const acc=await api('/api/hotel/'+slug+'/channel/account');
+  const a=acc&&acc.account;
+  document.getElementById('chAccount').innerHTML=_channelStatusLabel(a);
+  const connected=!!(a&&a.is_active);
+  document.getElementById('chSyncInvBtn').style.display=connected?'inline-flex':'none';
+  document.getElementById('chSyncBkBtn').style.display=connected?'inline-flex':'none';
+  document.getElementById('chDiscBtn').style.display=a?'inline-flex':'none';
+
+  const rt=await api('/api/hotel/'+slug+'/channel/room-types');
+  const rtb=document.getElementById('chRtTbody');
+  if(rt&&rt.room_types&&rt.room_types.length){
+    rtb.innerHTML=rt.room_types.map(r=>`<tr>
+      <td><code style="font-family:monospace">${r.provider_code}</code></td>
+      <td>${r.room_type||'—'}</td>
+      <td>${r.provider_label||'—'}</td>
+      <td>${r.total_units||0}</td>
+      <td>${inr(r.base_rate)}</td>
+      <td>${r.is_active?'<span class="bdg ba">on</span>':'<span class="bdg bo">off</span>'}</td>
+      <td><button class="btn brd bsm" onclick="delRT(${r.id})">Del</button></td>
+    </tr>`).join('');
+  } else {
+    rtb.innerHTML='<tr><td colspan="7" style="text-align:center;color:var(--t2)">No room types mapped yet.</td></tr>';
+  }
+
+  const bk=await api('/api/hotel/'+slug+'/channel/bookings?limit=20');
+  const btb=document.getElementById('chBkTbody');
+  if(bk&&bk.bookings&&bk.bookings.length){
+    btb.innerHTML=bk.bookings.map(b=>{
+      const st=b.status||'new';
+      const cls={ingested:'ba',cancelled:'bo',new:'bc',confirmed:'bv',modified:'bc'}[st]||'bc';
+      const ingestBtn=(st==='ingested'||st==='cancelled')?'':`<button class="btn bg bsm" onclick="ingestBk(${b.id})">Ingest</button>`;
+      return `<tr>
+        <td><span class="tag">${b.ota_source||'direct'}</span></td>
+        <td style="font-family:monospace;font-size:12px">${b.provider_ref||'—'}</td>
+        <td>${b.guest_name||'—'}<div style="color:var(--t2);font-size:11px">${b.guest_phone||''}</div></td>
+        <td>${fd(b.checkin_date)}</td>
+        <td>${fd(b.checkout_date)}</td>
+        <td>${inr(b.total_amount)}</td>
+        <td><span class="bdg ${cls}">${st}</span></td>
+        <td>${ingestBtn}</td>
+      </tr>`;
+    }).join('');
+  } else {
+    btb.innerHTML='<tr><td colspan="8" style="text-align:center;color:var(--t2)">No reservations yet.</td></tr>';
+  }
+
+  const log=await api('/api/hotel/'+slug+'/channel/sync-log?limit=15');
+  const ltb=document.getElementById('chLogTbody');
+  if(log&&log.log&&log.log.length){
+    ltb.innerHTML=log.log.map(l=>{
+      const cls={ok:'ba',failed:'bo',dry_run:'bc'}[l.status]||'bc';
+      const when=l.created_at?new Date(l.created_at).toLocaleString():'—';
+      return `<tr><td style="color:var(--t2);font-size:12px">${when}</td><td>${l.operation}</td><td><span class="bdg ${cls}">${l.status}</span></td><td>${l.records||0}</td><td style="font-size:12px">${l.error?('<span style=\"color:#f85149\">'+l.error+'</span>'):(l.payload_summary||'—')}</td></tr>`;
+    }).join('');
+  } else {
+    ltb.innerHTML='<tr><td colspan="5" style="text-align:center;color:var(--t2)">No sync events yet.</td></tr>';
+  }
+}
+function openChConnect(){
+  document.getElementById('mT').textContent='Connect channel manager';
+  document.getElementById('mC').innerHTML=`
+    <div class="fg"><label>Provider</label>
+      <select id="chProv" class="ti" style="width:100%">
+        <option value="axisrooms">AxisRooms</option>
+        <option value="staah">STAAH</option>
+      </select></div>
+    <div class="fg"><label>Hotel code (provider's id for your property)</label><input id="chCode" class="ti"></div>
+    <div class="fg"><label>Base URL (leave blank for default)</label><input id="chUrl" class="ti" placeholder="https://channels.axisrooms.com/api"></div>
+    <div class="fg"><label>API key</label><input id="chKey" class="ti" placeholder="leave blank to keep existing"></div>
+    <div class="fg"><label>API secret</label><input id="chSec" class="ti" placeholder="leave blank to keep existing"></div>
+    <div class="fg"><label><input type="checkbox" id="chDry" checked> Dry-run (no live OTA calls)</label></div>
+    <div class="fg"><label><input type="checkbox" id="chAct"> Activate after save</label></div>`;
+  document.getElementById('mSv').style.display='inline-flex';
+  svFn=async()=>{
+    const body={
+      provider:document.getElementById('chProv').value,
+      hotel_code:document.getElementById('chCode').value.trim(),
+      base_url:document.getElementById('chUrl').value.trim(),
+      api_key:document.getElementById('chKey').value.trim(),
+      api_secret:document.getElementById('chSec').value.trim(),
+      dry_run:document.getElementById('chDry').checked,
+      is_active:document.getElementById('chAct').checked,
+    };
+    const r=await api('/api/hotel/'+slug+'/channel/connect','POST',body);
+    if(r&&r.success){toast('Connected');cM();lChannel();}else toast('Failed','er');
+  };
+  oM();
+}
+function openAddRT(){
+  document.getElementById('mT').textContent='Add room-type mapping';
+  document.getElementById('mC').innerHTML=`
+    <div class="fg"><label>Internal room_type (matches your rooms.room_type)</label><input id="rtType" class="ti" placeholder="Deluxe AC"></div>
+    <div class="fg"><label>Provider code</label><input id="rtCode" class="ti" placeholder="DLX"></div>
+    <div class="fg"><label>Provider label (for ops)</label><input id="rtLabel" class="ti" placeholder="Deluxe AC – Double"></div>
+    <div class="fg"><label>Total units sold on OTAs</label><input id="rtUnits" type="number" class="ti" value="0"></div>
+    <div class="fg"><label>Base rate</label><input id="rtRate" type="number" class="ti" value="0"></div>`;
+  document.getElementById('mSv').style.display='inline-flex';
+  svFn=async()=>{
+    const body={
+      room_type:document.getElementById('rtType').value.trim(),
+      provider_code:document.getElementById('rtCode').value.trim(),
+      provider_label:document.getElementById('rtLabel').value.trim(),
+      total_units:parseInt(document.getElementById('rtUnits').value||'0',10),
+      base_rate:parseFloat(document.getElementById('rtRate').value||'0'),
+    };
+    if(!body.room_type||!body.provider_code){toast('room_type and provider_code required','er');return;}
+    const r=await api('/api/hotel/'+slug+'/channel/room-types','POST',body);
+    if(r&&r.success){toast('Saved');cM();lChannel();}else toast('Failed','er');
+  };
+  oM();
+}
+async function delRT(id){
+  if(!confirm('Delete this mapping?'))return;
+  const r=await api('/api/hotel/'+slug+'/channel/room-types/'+id,'DELETE');
+  if(r&&r.success){toast('Deleted');lChannel();}else toast('Failed','er');
+}
+async function syncInv(){
+  toast('Pushing inventory…');
+  const r=await api('/api/hotel/'+slug+'/channel/sync/inventory','POST',{});
+  if(r&&r.success){toast('Inventory pushed');lChannel();}else toast('Push failed','er');
+}
+async function syncBookings(){
+  toast('Pulling bookings…');
+  const r=await api('/api/hotel/'+slug+'/channel/sync/bookings','POST',{});
+  if(r&&r.success){toast('Bookings pulled');lChannel();}else toast('Pull failed','er');
+}
+async function disconnectCh(){
+  if(!confirm('Disconnect channel manager? Credentials will be wiped; mappings stay.'))return;
+  const r=await fetch('/api/hotel/'+slug+'/channel/disconnect',{method:'DELETE',headers:{'Content-Type':'application/json'}}).then(x=>x.json()).catch(()=>null);
+  if(r&&r.success){toast('Disconnected');lChannel();}else toast('Failed','er');
+}
+async function ingestBk(cbId){
+  const room=prompt('Assign which room number? (must be a vacant room for these dates)');
+  if(!room)return;
+  const r=await api('/api/hotel/'+slug+'/channel/bookings/'+cbId+'/ingest','POST',{room_number:room.trim()});
+  if(r&&r.success){toast('Ingested as '+r.booking_id);lChannel();}else toast(r&&r.detail?r.detail:'Failed','er');
+}
+
 init();
 </script>
 </body>

@@ -214,6 +214,49 @@ SELECT 'IMPORTANT: Change admin password at /admin after first login!' AS warnin
 
 
 
+-- ── 8. Night audit + KPI reports ─────────────────────────────────
+-- One row per (hotel_id, audit_date). Auto-populated by the nightly
+-- scheduler; can also be back-filled manually from the dashboard.
+ALTER TABLE hotels   ADD COLUMN IF NOT EXISTS sched_night_audit_hour INTEGER DEFAULT 2;
+ALTER TABLE hotels   ADD COLUMN IF NOT EXISTS sched_night_audit_min  INTEGER DEFAULT 0;
+ALTER TABLE hotels   ADD COLUMN IF NOT EXISTS auto_post_room_rent    BOOLEAN DEFAULT TRUE;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ota_source             VARCHAR(60) DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS night_audits (
+    id                    SERIAL PRIMARY KEY,
+    hotel_id              INTEGER NOT NULL,
+    audit_date            DATE    NOT NULL,
+    status                VARCHAR(20)   DEFAULT 'completed',
+    total_rooms           INTEGER       DEFAULT 0,
+    occupied_rooms        INTEGER       DEFAULT 0,
+    available_rooms       INTEGER       DEFAULT 0,
+    room_nights_sold      INTEGER       DEFAULT 0,
+    room_revenue          NUMERIC(12,2) DEFAULT 0,
+    food_revenue          NUMERIC(12,2) DEFAULT 0,
+    service_revenue       NUMERIC(12,2) DEFAULT 0,
+    other_revenue         NUMERIC(12,2) DEFAULT 0,
+    total_revenue         NUMERIC(12,2) DEFAULT 0,
+    tax_collected         NUMERIC(12,2) DEFAULT 0,
+    cash_collected        NUMERIC(12,2) DEFAULT 0,
+    online_collected      NUMERIC(12,2) DEFAULT 0,
+    pending_revenue       NUMERIC(12,2) DEFAULT 0,
+    adr                   NUMERIC(10,2) DEFAULT 0,
+    revpar                NUMERIC(10,2) DEFAULT 0,
+    trevpar               NUMERIC(10,2) DEFAULT 0,
+    occupancy_pct         NUMERIC(6,2)  DEFAULT 0,
+    checkins_count        INTEGER       DEFAULT 0,
+    checkouts_count       INTEGER       DEFAULT 0,
+    no_shows_count        INTEGER       DEFAULT 0,
+    rent_postings_added   INTEGER       DEFAULT 0,
+    rent_postings_skipped INTEGER       DEFAULT 0,
+    errors                TEXT          DEFAULT '',
+    notes                 TEXT          DEFAULT '',
+    run_at                TIMESTAMP     DEFAULT NOW(),
+    run_by                VARCHAR(100)  DEFAULT 'scheduler',
+    UNIQUE(hotel_id, audit_date)
+);
+CREATE INDEX IF NOT EXISTS idx_night_audits_hotel_date ON night_audits(hotel_id, audit_date DESC);
+
 -- ════════════════════════════════════════════════════════════════
 -- Channel Manager (OTA aggregator) integration
 -- One adapter integration here = MMT + Goibibo + Booking.com + Agoda
