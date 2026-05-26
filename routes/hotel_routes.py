@@ -95,10 +95,13 @@ async def hotel_booking_detail(slug: str, bid: str, request: Request):
     user = await require_hotel_access(request, slug)
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel: raise HTTPException(404)
-    bk = await db.get_booking_by_id(bid)
+    bk = await db.get_booking_by_id(bid, hotel_id=hotel["id"])
     if not bk: raise HTTPException(404)
-    charges = await db.get_charges_for_booking(bid)
-    extra = await db.fetch("SELECT * FROM additional_booking_guests WHERE booking_id=$1", bid)
+    charges = await db.get_charges_for_booking(bid, hotel_id=hotel["id"])
+    extra = await db.fetch(
+        "SELECT * FROM additional_booking_guests WHERE booking_id=$1 AND hotel_id=$2",
+        bid, hotel["id"],
+    )
     # Hide ID proof photos from staff who can't view them
     if not user.get("can_view_id_proofs") and user.get("role") != "superadmin":
         bk["id_proof_photo"] = "🔒 Hidden"
@@ -257,7 +260,11 @@ async def service_requests(slug: str, request: Request):
 @router.put("/{slug}/service-requests/{rid}/done")
 async def mark_done(slug: str, rid: str, request: Request):
     await require_hotel_access(request, slug)
-    row = await db.mark_service_done(rid)
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    row = await db.mark_service_done(rid, hotel_id=hotel["id"])
+    if not row:
+        raise HTTPException(404, "Service request not found in this hotel")
     return JSONResponse({"success": True, "request": row})
 
 # ── Broadcast ─────────────────────────────────────────────────────
@@ -281,10 +288,21 @@ async def broadcast(slug: str, request: Request):
 @router.get("/{slug}/guests/search")
 async def search_guest(slug: str, request: Request):
     await require_hotel_access(request, slug)
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        raise HTTPException(404)
     phone = request.query_params.get("phone","").strip()
     id_num = request.query_params.get("id_number","").strip().upper()
     if not phone and not id_num: raise HTTPException(400, "Provide phone or id_number")
-    guest = await db.lookup_guest_by_phone(phone) if phone else await db.lookup_guest_by_id(id_num)
+    # SECURITY: Always scope guest lookups to the caller's hotel — without
+    # this, hotel A staff could pull guest_name, ID type/number, photo URLs,
+    # alternate_phone, total_visits and total_spent for any guest of any
+    # hotel in the system by phone or ID number (cross-tenant PII leak).
+    guest = (
+        await db.lookup_guest_by_phone(phone, hotel_id=hotel["id"])
+        if phone else
+        await db.lookup_guest_by_id(id_num, hotel_id=hotel["id"])
+    )
     if not guest: return JSONResponse({"found": False})
     return JSONResponse({"found": True, "guest": guest})
 
@@ -315,7 +333,7 @@ async def approve_checkin(slug: str, bid: str, request: Request):
     await require_perm(request, slug, "can_approve_checkin")
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel: raise HTTPException(404)
-    bk = await db.get_booking_by_id(bid)
+    bk = await db.get_booking_by_id(bid, hotel_id=hotel["id"])
     if not bk: raise HTTPException(404)
     phone = bk["guest_phone"]
     from services.cache import get_session, set_session, set_room, calc_ttl
@@ -332,7 +350,7 @@ async def approve_checkin(slug: str, bid: str, request: Request):
     await set_session(phone, session, ttl)
     await set_room(bk["room_number"], phone, ttl)
     await db.set_room_occupied(bk["room_number"], hotel["id"])
-    await db.execute("UPDATE bookings SET status='Active',updated_at=NOW() WHERE booking_id=$1", bid)
+    await db.execute("UPDATE bookings SET status='Active',updated_at=NOW() WHERE booking_id=$1 AND hotel_id=$2", bid, hotel["id"])
     await send_text(hotel["instance_name"], phone,
         f"✅ *Check-in Approved!*\n━━━━━━━━━━━━━━━━━━\n"
         f"🏨 Welcome to *{hotel['hotel_name']}*!\n\n"
@@ -347,13 +365,13 @@ async def reject_checkin(slug: str, bid: str, request: Request):
     await require_perm(request, slug, "can_reject_checkin")
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel: raise HTTPException(404)
-    bk = await db.get_booking_by_id(bid)
+    bk = await db.get_booking_by_id(bid, hotel_id=hotel["id"])
     if not bk: raise HTTPException(404)
     from services.cache import delete_session, delete_room
     from services.whatsapp import send_text
     await delete_session(bk["guest_phone"])
     await delete_room(bk["room_number"])
-    await db.execute("UPDATE bookings SET status='Rejected',updated_at=NOW() WHERE booking_id=$1", bid)
+    await db.execute("UPDATE bookings SET status='Rejected',updated_at=NOW() WHERE booking_id=$1 AND hotel_id=$2", bid, hotel["id"])
     await send_text(hotel["instance_name"], bk["guest_phone"],
         "❌ *Check-in Request Rejected*\n\nPlease contact reception for assistance. 🙏")
     return JSONResponse({"success": True})

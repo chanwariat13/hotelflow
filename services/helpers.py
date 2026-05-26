@@ -1,12 +1,32 @@
-import httpx, base64, time, logging
+import httpx, base64, secrets, time, logging
 from datetime import datetime
 import pytz
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 
-def booking_id() -> str: return "BK" + str(int(time.time()*1000))[-10:]
-def request_id() -> str: return "SR" + str(int(time.time()*1000))[-10:]
+def booking_id() -> str:
+    """Generate a non-predictable booking id.
+
+    The legacy version was `"BK" + str(int(time.time()*1000))[-10:]` — a
+    pure timestamp suffix that:
+      * collided whenever two bookings landed in the same millisecond
+        (across hotels too), causing `INSERT … ON CONFLICT DO NOTHING` to
+        silently drop the loser;
+      * was trivially enumerable: knowing one id let you guess neighbours
+        and hit the previously-unauthenticated /api/guest/charges,
+        /api/guest/bill paths.
+
+    We keep the human-friendly "BK" prefix and short timestamp prefix so
+    operators can still eyeball recency, then append 6 hex chars from a
+    CSPRNG (24 bits of entropy on top of the timestamp).
+    """
+    return "BK" + str(int(time.time() * 1000))[-7:] + secrets.token_hex(3).upper()
+
+def request_id() -> str:
+    """Same shape as booking_id, prefix `SR`. See booking_id()."""
+    return "SR" + str(int(time.time() * 1000))[-7:] + secrets.token_hex(3).upper()
+
 def ist_now() -> datetime: return datetime.now(IST)
 
 def fmt_date(d) -> str:

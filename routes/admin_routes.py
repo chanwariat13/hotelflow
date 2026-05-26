@@ -457,7 +457,7 @@ async def _handle_razorpay_event(hotel: dict, body: dict):
             logger.warning("razorpay event missing booking ref: %s", body.get("id", ""))
             return
 
-        await db.mark_charges_paid(bid, "Online", ref)
+        await db.mark_charges_paid(bid, "Online", ref, hotel_id=hotel["id"])
         await db.insert_payment_log({
             "booking_id": bid, "guest_phone": phone, "room_number": room,
             "guest_name": "", "amount": amount, "payment_method": "Online",
@@ -465,8 +465,8 @@ async def _handle_razorpay_event(hotel: dict, body: dict):
         })
         await db.execute(
             "UPDATE bookings SET total_paid = COALESCE(total_paid,0) + $1, updated_at=NOW() "
-            "WHERE booking_id=$2",
-            amount, bid,
+            "WHERE booking_id=$2 AND hotel_id=$3",
+            amount, bid, hotel["id"],
         )
 
         # Notify guest + staff
