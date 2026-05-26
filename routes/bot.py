@@ -53,7 +53,7 @@ async def handle_message(body: dict, instance_name: str):
     gotenberg  = hotel.get("gotenberg_url","http://localhost:3000")
 
     # Blocked?
-    if await is_blocked(phone): return
+    if await is_blocked(phone, hid): return
 
     UP = text.upper().strip()
 
@@ -96,14 +96,36 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # REJECT <phone>
     m = re.match(r"^REJECT\s+(\d+)$", UP)
     if m:
+        if not can("can_reject_checkin"):
+            await send_text(instance, phone, "⛔ You don't have permission to reject check-ins."); return
         target = m.group(1)
+        # Scope to *this* hotel: a staff member here must never be able to
+        # reject a guest who is checked into a different tenant. We require
+        # an active booking for `target` at this hotel before touching state.
+        result = await db.execute(
+            "UPDATE bookings SET status='Rejected',updated_at=NOW() "
+            "WHERE guest_phone=$1 AND status='Active' AND hotel_id=$2",
+            target, hid,
+        )
+        affected = 0
+        try:
+            # asyncpg returns e.g. "UPDATE 1" — pull off the count.
+            affected = int(str(result).split()[-1]) if result else 0
+        except Exception:
+            affected = 0
         sess = await get_session(target)
-        room = sess.get("room","") if sess else ""
-        await delete_session(target)
-        if room: await delete_room(room)
-        await db.execute("UPDATE bookings SET status='Rejected',updated_at=NOW() WHERE guest_phone=$1 AND status='Active'", target)
-        await send_text(instance, phone, f"❌ Rejected: {target} | Room: {room}")
-        await send_text(instance, target, "❌ *Check-in Rejected*\nPlease contact reception. 🙏")
+        # Only mutate cached session/room state if there was a matching
+        # booking at *this* hotel. Otherwise the session belongs to another
+        # tenant or the guest, and we must not touch it.
+        if affected > 0:
+            room = sess.get("room","") if sess else ""
+            await delete_session(target)
+            if room: await delete_room(room)
+            await send_text(instance, phone, f"❌ Rejected: {target} | Room: {room}")
+            await send_text(instance, target, "❌ *Check-in Rejected*\nPlease contact reception. 🙏")
+        else:
+            await send_text(instance, phone,
+                f"⚠️ No active booking for {target} at this hotel — nothing to reject.")
         return
 
     # CASH RECEIVED <phone>
@@ -215,11 +237,12 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
         await send_text(instance, phone, f"🔗 Room {room}:\n{reg_url}")
         return
 
-    # BLOCK / UNBLOCK
+    # BLOCK / UNBLOCK — scoped per hotel so one tenant can't block guests
+    # at another tenant.
     m = re.match(r"^BLOCK\s+(\d+)$", UP)
-    if m: await block_user(m.group(1)); await send_text(instance, phone, f"🚫 {m.group(1)} blocked."); return
+    if m: await block_user(m.group(1), hid); await send_text(instance, phone, f"🚫 {m.group(1)} blocked."); return
     m = re.match(r"^UNBLOCK\s+(\d+)$", UP)
-    if m: await unblock_user(m.group(1)); await send_text(instance, phone, f"✅ {m.group(1)} unblocked."); return
+    if m: await unblock_user(m.group(1), hid); await send_text(instance, phone, f"✅ {m.group(1)} unblocked."); return
 
     # BROADCAST <msg>
     m = re.match(r"^BROADCAST\s+(.+)$", text, re.DOTALL | re.IGNORECASE)

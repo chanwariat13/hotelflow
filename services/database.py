@@ -175,6 +175,174 @@ async def ensure_schema_v2():
       - rooms.housekeeping_status / last_cleaned_by / last_cleaned_at
     """
     try:
+        # 0. Base tables — created on a fresh DB so the app boots without
+        # requiring an out-of-band `psql -f migration.sql` step. These are
+        # the parent tables every other migration step assumes already
+        # exist; CREATE TABLE IF NOT EXISTS leaves established databases
+        # untouched.
+        await execute("""
+            CREATE TABLE IF NOT EXISTS bookings (
+                id                   SERIAL PRIMARY KEY,
+                booking_id           VARCHAR(40)  NOT NULL UNIQUE,
+                hotel_id             INTEGER      NOT NULL DEFAULT 1,
+                room_number          VARCHAR(20)  NOT NULL DEFAULT '',
+                guest_name           VARCHAR(200) NOT NULL DEFAULT '',
+                guest_phone          VARCHAR(20)  NOT NULL DEFAULT '',
+                alternate_phone      VARCHAR(20)  DEFAULT '',
+                guest_count          INTEGER      DEFAULT 1,
+                checkin_date         TIMESTAMP,
+                checkout_date        TIMESTAMP,
+                status               VARCHAR(20)  DEFAULT 'Active',
+                payment_mode         VARCHAR(40)  DEFAULT 'Pay at checkout',
+                id_proof_type        VARCHAR(40)  DEFAULT '',
+                id_proof_number      VARCHAR(80)  DEFAULT '',
+                id_proof_photo       TEXT         DEFAULT '',
+                id_proof_photo_back  TEXT         DEFAULT '',
+                total_paid           NUMERIC(12,2) DEFAULT 0,
+                created_at           TIMESTAMP    DEFAULT NOW(),
+                updated_at           TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("""
+            CREATE TABLE IF NOT EXISTS rooms (
+                id            SERIAL PRIMARY KEY,
+                hotel_id      INTEGER      NOT NULL DEFAULT 1,
+                room_number   VARCHAR(20)  NOT NULL,
+                room_type     VARCHAR(60)  DEFAULT 'Standard',
+                floor         INTEGER      DEFAULT 1,
+                room_rate     NUMERIC(10,2) DEFAULT 0,
+                qr_secret     VARCHAR(32)  DEFAULT '',
+                status        VARCHAR(20)  DEFAULT 'Vacant',
+                created_at    TIMESTAMP    DEFAULT NOW(),
+                updated_at    TIMESTAMP    DEFAULT NOW(),
+                UNIQUE (hotel_id, room_number)
+            )
+        """)
+        await execute("""
+            CREATE TABLE IF NOT EXISTS stay_charges (
+                id              SERIAL PRIMARY KEY,
+                hotel_id        INTEGER      NOT NULL DEFAULT 1,
+                booking_id      VARCHAR(40)  NOT NULL,
+                charge_date     TIMESTAMP    DEFAULT NOW(),
+                service_type    VARCHAR(60)  NOT NULL DEFAULT 'Other',
+                description     TEXT         DEFAULT '',
+                amount          NUMERIC(10,2) DEFAULT 0,
+                tax             NUMERIC(10,2) DEFAULT 0,
+                total           NUMERIC(10,2) DEFAULT 0,
+                payment_status  VARCHAR(20)  DEFAULT 'Pending',
+                payment_method  VARCHAR(20)  DEFAULT '',
+                order_ref       VARCHAR(120) DEFAULT '',
+                created_at      TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("""
+            CREATE TABLE IF NOT EXISTS payment_logs (
+                id             SERIAL PRIMARY KEY,
+                hotel_id       INTEGER      NOT NULL DEFAULT 1,
+                booking_id     VARCHAR(40)  NOT NULL DEFAULT '',
+                guest_phone    VARCHAR(20)  DEFAULT '',
+                room_number    VARCHAR(20)  DEFAULT '',
+                guest_name     VARCHAR(200) DEFAULT '',
+                amount         NUMERIC(10,2) DEFAULT 0,
+                payment_method VARCHAR(40)  DEFAULT '',
+                reference      VARCHAR(120) DEFAULT '',
+                payment_date   TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("""
+            CREATE TABLE IF NOT EXISTS services (
+                id            SERIAL PRIMARY KEY,
+                hotel_id      INTEGER      NOT NULL DEFAULT 1,
+                service_name  VARCHAR(150) NOT NULL,
+                category      VARCHAR(60)  DEFAULT 'Other',
+                price         NUMERIC(10,2) DEFAULT 0,
+                department    VARCHAR(60)  DEFAULT 'Reception',
+                description   TEXT         DEFAULT '',
+                is_active     BOOLEAN      DEFAULT TRUE,
+                created_at    TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        await execute("""
+            CREATE TABLE IF NOT EXISTS staff_departments (
+                id              SERIAL PRIMARY KEY,
+                hotel_id        INTEGER      NOT NULL DEFAULT 1,
+                department      VARCHAR(60)  NOT NULL,
+                display_name    VARCHAR(100) DEFAULT '',
+                whatsapp_number VARCHAR(20)  DEFAULT '',
+                is_active       BOOLEAN      DEFAULT TRUE,
+                created_at      TIMESTAMP    DEFAULT NOW(),
+                UNIQUE (hotel_id, department)
+            )
+        """)
+        await execute("""
+            CREATE TABLE IF NOT EXISTS service_requests (
+                id            SERIAL PRIMARY KEY,
+                hotel_id      INTEGER      NOT NULL DEFAULT 1,
+                request_id    VARCHAR(40)  NOT NULL UNIQUE,
+                booking_id    VARCHAR(40)  DEFAULT '',
+                service_name  VARCHAR(150) DEFAULT '',
+                category      VARCHAR(60)  DEFAULT '',
+                department    VARCHAR(60)  DEFAULT '',
+                status        VARCHAR(20)  DEFAULT 'Pending',
+                priority      VARCHAR(20)  DEFAULT 'Normal',
+                guest_note    TEXT         DEFAULT '',
+                charge_amount NUMERIC(10,2) DEFAULT 0,
+                requested_at  TIMESTAMP    DEFAULT NOW(),
+                completed_at  TIMESTAMP
+            )
+        """)
+        await execute("""
+            CREATE TABLE IF NOT EXISTS additional_booking_guests (
+                id                   SERIAL PRIMARY KEY,
+                hotel_id             INTEGER      NOT NULL DEFAULT 1,
+                booking_id           VARCHAR(40)  NOT NULL,
+                guest_name           VARCHAR(200) DEFAULT '',
+                id_proof_type        VARCHAR(40)  DEFAULT '',
+                id_proof_number      VARCHAR(80)  DEFAULT '',
+                id_proof_photo       TEXT         DEFAULT '',
+                id_proof_photo_back  TEXT         DEFAULT '',
+                created_at           TIMESTAMP    DEFAULT NOW()
+            )
+        """)
+        # Backfill columns that older deployments may have missed.
+        await execute("ALTER TABLE bookings     ADD COLUMN IF NOT EXISTS total_paid     NUMERIC(12,2) DEFAULT 0")
+        await execute("ALTER TABLE bookings     ADD COLUMN IF NOT EXISTS updated_at     TIMESTAMP DEFAULT NOW()")
+        await execute("ALTER TABLE rooms        ADD COLUMN IF NOT EXISTS updated_at     TIMESTAMP DEFAULT NOW()")
+        await execute("ALTER TABLE stay_charges ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20)  DEFAULT ''")
+        await execute("ALTER TABLE stay_charges ADD COLUMN IF NOT EXISTS order_ref      VARCHAR(120) DEFAULT ''")
+
+        # Composite unique on (hotel_id, room_number) so two hotels can both
+        # have a "101". Wrapped in a guard because the legacy schema may have
+        # only the single-column UNIQUE on room_number.
+        await execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'rooms_hotel_room_unique'
+                ) THEN
+                    BEGIN
+                        ALTER TABLE rooms
+                            ADD CONSTRAINT rooms_hotel_room_unique UNIQUE (hotel_id, room_number);
+                    EXCEPTION WHEN duplicate_table OR duplicate_object THEN
+                        NULL;
+                    END;
+                END IF;
+            END $$;
+        """)
+        # Drop legacy single-column UNIQUE if it's still present — it would
+        # otherwise prevent two hotels from sharing a room number even with
+        # the composite UNIQUE in place.
+        await execute("""
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'rooms_room_number_key'
+                ) THEN
+                    ALTER TABLE rooms DROP CONSTRAINT rooms_room_number_key;
+                END IF;
+            END $$;
+        """)
+
         # 1. New tables
         await execute("""
             CREATE TABLE IF NOT EXISTS audit_log (
@@ -770,11 +938,16 @@ async def get_room(room_number: str, hid: int) -> Optional[Dict]:
     return await fetchrow("SELECT * FROM rooms WHERE room_number=$1 AND hotel_id=$2", room_number, hid)
 
 async def upsert_room(hid: int, room_number: str, room_type: str, floor: int, rate: float, qr_secret: str):
+    # ON CONFLICT must match the multi-tenant unique key — using just
+    # `(room_number)` would let hotel B's "101" overwrite hotel A's "101".
+    # The composite UNIQUE constraint is created in ensure_schema_v2() and
+    # in migration.sql; we name it explicitly so this query stays stable
+    # even on databases that still also carry a legacy single-column UNIQUE.
     await execute("""
         INSERT INTO rooms (room_number,room_type,floor,room_rate,qr_secret,status,hotel_id)
         VALUES ($1,$2,$3,$4,$5,'Vacant',$6)
-        ON CONFLICT (room_number) DO UPDATE
-        SET room_type=$2,floor=$3,room_rate=$4,qr_secret=$5,hotel_id=$6,updated_at=NOW()""",
+        ON CONFLICT (hotel_id, room_number) DO UPDATE
+        SET room_type=$2,floor=$3,room_rate=$4,qr_secret=$5,updated_at=NOW()""",
         room_number, room_type, floor, rate, qr_secret, hid)
 
 async def update_room_rate(room_number: str, new_rate: float, hid: int):

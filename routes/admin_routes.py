@@ -15,8 +15,6 @@ import secrets
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/admin")
 
-def sa(request: Request): return require_superadmin(request)
-
 
 def _actor(user) -> str:
     if not user: return "system"
@@ -227,9 +225,13 @@ async def all_bookings(request: Request):
         bks = await db.fetch("SELECT b.*,COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Pending'),0) AS balance_due FROM bookings b LEFT JOIN stay_charges sc ON sc.booking_id=b.booking_id GROUP BY b.id ORDER BY b.created_at DESC LIMIT $1", limit)
     return JSONResponse({"bookings": bks})
 
-@router.post("/admin/password")
+@router.put("/password")
 async def change_admin_password(request: Request):
-    """Change the master admin password."""
+    """Change the master admin password.
+
+    Frontend calls PUT /api/admin/password. The router itself has
+    prefix='/api/admin', so the route declared here is just '/password'.
+    """
     user = await require_superadmin(request)
     d = await request.json()
     new_pw = (d.get("new_password") or "").strip()

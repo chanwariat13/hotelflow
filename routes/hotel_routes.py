@@ -6,9 +6,8 @@ Permissions enforced per role. Zero hardcoding.
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from services import database as db
-from services.auth import require_hotel_access, require_perm, get_current_user
+from services.auth import require_hotel_access, require_perm
 from services.cache import get_room as cache_room, delete_session, delete_room, delete_pending
-import secrets
 
 router = APIRouter(prefix="/api/hotel")
 
@@ -214,13 +213,37 @@ async def get_settings(slug: str, request: Request):
 
 @router.put("/{slug}/settings")
 async def update_settings(slug: str, request: Request):
-    """Owner can update hotel settings. Instant — no redeploy."""
+    """Owner can update hotel settings. Instant — no redeploy.
+
+    Payment credentials (razorpay_key_id / razorpay_secret /
+    razorpay_webhook_secret) are *not* editable from the per-hotel API to
+    keep them in the superadmin's hands. The owner can configure UPI and
+    branding here, but rotating Razorpay keys must go through the master
+    admin (POST /api/admin/hotels/{hid}). This avoids a hotel owner
+    accidentally — or maliciously — pointing payouts at another account.
+    """
     await require_perm(request, slug, "can_edit_hotel")
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel: raise HTTPException(404)
-    d = await request.json()
+    d = await request.json() or {}
+    # Strip protected keys before forwarding to the DB layer.
+    blocked = {
+        "razorpay_secret", "razorpay_key_id", "razorpay_webhook_secret",
+        # Slug / instance_name uniqueness is owned by superadmin too.
+        "slug", "instance_name", "is_active",
+    }
+    rejected = [k for k in d.keys() if k in blocked]
+    for k in rejected:
+        d.pop(k, None)
     updated = await db.update_hotel(hotel["id"], d)
-    return JSONResponse({"success": True, "hotel": updated})
+    resp = {"success": True, "hotel": updated}
+    if rejected:
+        resp["ignored_fields"] = rejected
+        resp["message"] = (
+            "Some fields require master-admin access and were ignored: "
+            + ", ".join(rejected)
+        )
+    return JSONResponse(resp)
 
 # ── Service requests ───────────────────────────────────────────────
 @router.get("/{slug}/service-requests")

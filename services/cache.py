@@ -45,16 +45,28 @@ async def delete_room(room: str):
     r = await get_redis()
     await r.delete(f"room:{room}")
 
-async def is_blocked(phone: str) -> bool:
+async def is_blocked(phone: str, hotel_id: int = 0) -> bool:
+    """Block keys are scoped per hotel so one tenant can't block guests at
+    another tenant. The legacy global `blocked:<phone>` key is consulted as
+    a fallback for backward compatibility — once it expires there it is
+    only the per-hotel namespace that matters."""
     r = await get_redis()
+    if hotel_id:
+        if await r.get(f"blocked:{hotel_id}:{phone}"):
+            return True
     return bool(await r.get(f"blocked:{phone}"))
 
-async def block_user(phone: str):
+async def block_user(phone: str, hotel_id: int = 0):
     r = await get_redis()
-    await r.set(f"blocked:{phone}", "1")
+    key = f"blocked:{hotel_id}:{phone}" if hotel_id else f"blocked:{phone}"
+    await r.set(key, "1")
 
-async def unblock_user(phone: str):
+async def unblock_user(phone: str, hotel_id: int = 0):
     r = await get_redis()
+    if hotel_id:
+        await r.delete(f"blocked:{hotel_id}:{phone}")
+    # Always clear the legacy key too, so an UNBLOCK from any hotel removes
+    # a stale globally-blocked entry from the previous code path.
     await r.delete(f"blocked:{phone}")
 
 async def get_pending(phone: str) -> Optional[dict]:

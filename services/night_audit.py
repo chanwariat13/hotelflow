@@ -115,8 +115,8 @@ async def compute_metrics(hotel_id: int, audit_date: date) -> Dict[str, Any]:
              COALESCE(SUM(sc.total) FILTER(WHERE sc.service_type NOT IN ('Room Rent','Food')),0) AS service_revenue,
              COALESCE(SUM(sc.tax)                                                     ,0) AS tax_collected,
              COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Pending')         ,0) AS pending_revenue,
-             COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Paid' AND sc.payment_method ILIKE 'cash'),0) AS cash_collected,
-             COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Paid' AND sc.payment_method NOT ILIKE 'cash'),0) AS online_collected
+             COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Paid' AND sc.payment_method ILIKE '%cash%'),0) AS cash_collected,
+             COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Paid' AND sc.payment_method NOT ILIKE '%cash%'),0) AS online_collected
            FROM stay_charges sc
            JOIN bookings    b ON b.booking_id = sc.booking_id
            WHERE b.hotel_id = $1 AND sc.charge_date::date = $2""",
