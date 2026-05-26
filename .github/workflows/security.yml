@@ -1,0 +1,54 @@
+name: security
+
+# Lightweight security gate for every push and PR.
+#   * pip-audit  — flags known CVEs in pinned dependencies (advisory only;
+#                  failures don't block merges so a fresh CVE can't strand us
+#                  on a Friday).
+#   * bandit     — static analysis of *our* Python sources at MEDIUM+ severity.
+#                  This DOES block the build because findings here are usually
+#                  real bugs (eval, shell=True, hardcoded creds).
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Weekly Monday 06:00 UTC re-scan picks up newly-published CVEs even when
+    # the repo hasn't changed.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    name: pip-audit (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pip-audit
+        run: pip install --no-cache-dir pip-audit
+      - name: Audit pinned dependencies
+        # `|| true` keeps the job advisory — see workflow header. Output is
+        # still printed to the run log so reviewers can see findings.
+        run: pip-audit -r requirements.txt --strict || true
+
+  bandit:
+    name: bandit (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install bandit
+        run: pip install --no-cache-dir bandit
+      - name: Static analysis
+        # Scan everything under the repo except tests / vendor / venv. -ll
+        # = report MEDIUM+; -ii = confidence MEDIUM+. Anything below those
+        # bars is too noisy to gate on.
+        run: bandit -r . -ll -ii -x ./tests,./.venv,./venv

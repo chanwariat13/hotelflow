@@ -124,3 +124,28 @@ async def verify_auth_token(token: str) -> Optional[dict]:
 async def revoke_auth_token(token: str):
     r = await get_redis()
     await r.delete(f"auth:{token}")
+
+
+async def claim_event(scope: str, event_id: str, ttl: int = 7 * 24 * 3600) -> bool:
+    """Idempotency guard for webhook deliveries.
+
+    Atomically mark `event_id` as processed for the given `scope` (e.g.
+    `f"razorpay:{hotel_id}"`). Returns True on the FIRST claim — caller
+    must proceed with side effects. Returns False on every subsequent
+    delivery — caller must short-circuit.
+
+    Razorpay (and most other webhook providers) retry on any non-2xx /
+    timeout for up to 24h. Without this guard, retries replayed
+    `payment_link.paid` events through `_handle_razorpay_event`,
+    double-marking charges paid, double-incrementing `total_paid`, and
+    inserting duplicate `payment_log` rows. TTL defaults to 7 days, which
+    is well past every reasonable retry window.
+    """
+    # If we don't have an id we cannot dedupe. Better to allow a single
+    # processing through than to silently drop legitimate traffic.
+    if not event_id:
+        return True
+    r = await get_redis()
+    key = f"evt:{scope}:{event_id}"
+    # SET key value NX EX ttl  →  returns True only if the key didn't exist.
+    return bool(await r.set(key, "1", nx=True, ex=ttl))

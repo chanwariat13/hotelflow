@@ -18,10 +18,15 @@ def _truthy(val: str) -> bool:
     return (val or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-# When serving over HTTPS in production, set COOKIE_SECURE=1 in env so the
-# cookie is only sent on TLS connections. Default off so local http://localhost
-# development still works without flipping anything.
-_COOKIE_SECURE = _truthy(os.getenv("COOKIE_SECURE", ""))
+# ── Cookie security defaults ────────────────────────────────────────────────
+# We deliberately default to a SECURE cookie now: production deployments are
+# always behind TLS and the previous default of `Secure=False` meant that any
+# proxy misconfig would let the auth cookie leak over plaintext HTTP. For
+# local `http://localhost` development, set COOKIE_SECURE=0 to opt out.
+#
+# SameSite default is "lax" which is fine for normal navigations. Operators
+# running the dashboard on a separate origin can flip COOKIE_SAMESITE=strict.
+_COOKIE_SECURE = _truthy(os.getenv("COOKIE_SECURE", "1"))
 _COOKIE_SAMESITE = (os.getenv("COOKIE_SAMESITE", "lax").strip().lower() or "lax")
 
 
@@ -48,9 +53,12 @@ async def admin_login(request: Request):
     if not user:
         return JSONResponse({"success": False, "error": "Invalid credentials"}, status_code=401)
     token = await create_auth_token(user["id"], "superadmin", 0, "", {}, TOKEN_TTL)
+    # SECURITY: do NOT echo the token in the JSON body. The HttpOnly cookie
+    # set below carries the session; mirroring the value in JSON tempted the
+    # frontend to stash it in `sessionStorage`, which defeats `HttpOnly` (XSS
+    # could read it). The frontend authenticates via cookie + `/auth/me`.
     resp = JSONResponse({
         "success": True,
-        "token": token,
         "name": user["name"],
         "role": "superadmin",
     })
@@ -90,9 +98,9 @@ async def hotel_login(slug: str, request: Request):
     extra["user_role"] = user["role"]
 
     token = await create_auth_token(user["id"], user["role"], hotel["id"], slug, extra, TOKEN_TTL)
+    # SECURITY: token is delivered via HttpOnly cookie only — see admin_login.
     resp = JSONResponse({
         "success": True,
-        "token": token,
         "name": user["name"],
         "role": user["role"],
         "slug": slug,
