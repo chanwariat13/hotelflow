@@ -144,6 +144,52 @@ CREATE INDEX IF NOT EXISTS idx_rooms_hotel        ON rooms(hotel_id, status);
 CREATE INDEX IF NOT EXISTS idx_services_hotel     ON services(hotel_id);
 CREATE INDEX IF NOT EXISTS idx_sr_status          ON service_requests(status);
 
+-- ── 5b. Real food / restaurant module ─────────────────────────────
+-- Replaces the legacy `hotels.menu_url` placeholder. Each hotel manages its
+-- own room-service menu here. Food orders auto-link to stay_charges so they
+-- show up on the bill and in revenue reports without extra plumbing.
+CREATE TABLE IF NOT EXISTS hotel_food_items (
+    id              SERIAL PRIMARY KEY,
+    hotel_id        INTEGER       NOT NULL,
+    category        VARCHAR(80)   DEFAULT 'Other',
+    name            VARCHAR(150)  NOT NULL,
+    description     TEXT          DEFAULT '',
+    price           NUMERIC(10,2) NOT NULL DEFAULT 0,
+    image_url       TEXT          DEFAULT '',
+    type            VARCHAR(20)   DEFAULT 'veg',     -- veg / nonveg / egg
+    is_available    BOOLEAN       DEFAULT TRUE,
+    is_bestseller   BOOLEAN       DEFAULT FALSE,
+    spice_level     VARCHAR(20)   DEFAULT '',
+    serving_hours   VARCHAR(50)   DEFAULT '',
+    sort_order      INTEGER       DEFAULT 0,
+    created_at      TIMESTAMP     DEFAULT NOW(),
+    updated_at      TIMESTAMP     DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_food_items_hotel ON hotel_food_items(hotel_id, is_available);
+CREATE INDEX IF NOT EXISTS idx_food_items_cat   ON hotel_food_items(hotel_id, category);
+
+CREATE TABLE IF NOT EXISTS hotel_food_orders (
+    id              SERIAL PRIMARY KEY,
+    hotel_id        INTEGER       NOT NULL,
+    booking_id      VARCHAR(40)   DEFAULT '',
+    room_number     VARCHAR(20)   DEFAULT '',
+    guest_phone     VARCHAR(20)   DEFAULT '',
+    guest_name      VARCHAR(150)  DEFAULT '',
+    items_json      JSONB         NOT NULL DEFAULT '[]'::jsonb,
+    subtotal        NUMERIC(10,2) DEFAULT 0,
+    tax             NUMERIC(10,2) DEFAULT 0,
+    total           NUMERIC(10,2) DEFAULT 0,
+    notes           TEXT          DEFAULT '',
+    status          VARCHAR(20)   DEFAULT 'Placed',
+    stay_charge_id  INTEGER,
+    created_at      TIMESTAMP     DEFAULT NOW(),
+    updated_at      TIMESTAMP     DEFAULT NOW(),
+    delivered_at    TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_food_orders_hotel   ON hotel_food_orders(hotel_id, status);
+CREATE INDEX IF NOT EXISTS idx_food_orders_booking ON hotel_food_orders(booking_id);
+CREATE INDEX IF NOT EXISTS idx_food_orders_room    ON hotel_food_orders(room_number, status);
+
 -- ── 6. Seed master admin (change password after first login!) ─────
 -- Default: admin / admin123  ← CHANGE THIS IMMEDIATELY
 -- Hash format expected by services/auth.py:verify_password():

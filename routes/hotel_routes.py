@@ -334,3 +334,111 @@ async def reject_checkin(slug: str, bid: str, request: Request):
     await send_text(hotel["instance_name"], bk["guest_phone"],
         "❌ *Check-in Request Rejected*\n\nPlease contact reception for assistance. 🙏")
     return JSONResponse({"success": True})
+
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# REAL FOOD / RESTAURANT MODULE — per-hotel endpoints
+# The hotel owner / manager uses these from their dashboard. The menu they
+# build here is what guests see at /food/{slug}, what the bot serves when
+# guests type "menu", and what powers the food revenue line on the dashboard.
+# ══════════════════════════════════════════════════════════════════
+@router.get("/{slug}/food/items")
+async def hotel_list_food_items(slug: str, request: Request):
+    await require_hotel_access(request, slug)
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    items = await db.list_food_items(hotel["id"], available_only=False)
+    cats  = await db.list_food_categories(hotel["id"])
+    return JSONResponse({"items": items, "categories": cats})
+
+
+@router.post("/{slug}/food/items")
+async def hotel_create_food_item(slug: str, request: Request):
+    """Owners/managers with can_manage_services can edit the food menu."""
+    await require_perm(request, slug, "can_manage_services")
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    data = await request.json()
+    if not (data.get("name") or "").strip():
+        raise HTTPException(400, "name is required")
+    item = await db.create_food_item(hotel["id"], data)
+    return JSONResponse({"success": True, "item": item})
+
+
+@router.put("/{slug}/food/items/{item_id}")
+async def hotel_update_food_item(slug: str, item_id: int, request: Request):
+    await require_perm(request, slug, "can_manage_services")
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    data = await request.json()
+    item = await db.update_food_item(item_id, hotel["id"], data)
+    if not item:
+        raise HTTPException(404, "Food item not found")
+    return JSONResponse({"success": True, "item": item})
+
+
+@router.delete("/{slug}/food/items/{item_id}")
+async def hotel_delete_food_item(slug: str, item_id: int, request: Request):
+    await require_perm(request, slug, "can_manage_services")
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    await db.delete_food_item(item_id, hotel["id"])
+    return JSONResponse({"success": True})
+
+
+@router.get("/{slug}/food/orders")
+async def hotel_list_food_orders(slug: str, request: Request):
+    await require_hotel_access(request, slug)
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    status = request.query_params.get("status") or None
+    orders = await db.list_food_orders(hotel["id"], status=status, limit=200)
+    for o in orders:
+        for k in ("created_at", "updated_at", "delivered_at"):
+            if o.get(k):
+                o[k] = o[k].isoformat()
+    return JSONResponse({"orders": orders})
+
+
+@router.patch("/{slug}/food/orders/{order_id}")
+async def hotel_update_food_order(slug: str, order_id: int, request: Request):
+    """Mark an order Preparing / Ready / Delivered / Cancelled.
+
+    Cancelling soft-cancels the linked stay_charge so the bill total updates
+    automatically.
+    """
+    await require_hotel_access(request, slug)
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    data = await request.json()
+    new_status = (data.get("status") or "").strip()
+    if not new_status:
+        raise HTTPException(400, "status is required")
+    try:
+        order = await db.update_food_order_status(order_id, hotel["id"], new_status)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not order:
+        raise HTTPException(404, "Food order not found")
+
+    # Notify the guest on key transitions so the bot stays useful even when the
+    # guest doesn't hit "/food" again.
+    try:
+        from services.whatsapp import send_text
+        if new_status == "Ready" and order.get("guest_phone"):
+            await send_text(hotel["instance_name"], order["guest_phone"],
+                f"🍽️ *Your food is ready!*\n🏨 Room: {order.get('room_number','')}\n"
+                f"It's on its way to your room. Bon appétit! 🙏")
+        elif new_status == "Delivered" and order.get("guest_phone"):
+            await send_text(hotel["instance_name"], order["guest_phone"],
+                f"✅ *Order delivered to Room {order.get('room_number','')}*\n"
+                f"Enjoy your meal! 😊")
+    except Exception:
+        pass
+
+    for k in ("created_at", "updated_at", "delivered_at"):
+        if order.get(k):
+            order[k] = order[k].isoformat()
+    return JSONResponse({"success": True, "order": order})
