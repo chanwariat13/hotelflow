@@ -18,7 +18,10 @@ EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 
 HOST       = os.getenv("HOST", "0.0.0.0")
 PORT       = int(os.getenv("PORT", 8000))
-SECRET_KEY = os.getenv("SECRET_KEY", "changeme")
+# SECRET_KEY: REQUIRED in production. Boot-time validation in main.py refuses
+# to start if this is empty or still the default placeholder. Generate one
+# with:  python -c "import secrets; print(secrets.token_urlsafe(48))"
+SECRET_KEY = os.getenv("SECRET_KEY", "")
 BASE_URL   = os.getenv("BASE_URL", "http://localhost:8000")
 GOTENBERG_URL = os.getenv("GOTENBERG_URL", "http://localhost:3000")
 TZ         = "Asia/Kolkata"
