@@ -6,7 +6,11 @@ from contextlib import asynccontextmanager
 import logging, os
 
 from config.settings import HOST, PORT, SECRET_KEY
-from services.database import get_pool, close_pool, ensure_admin_seed, ensure_schema_v2
+from services.database import (
+    get_pool, close_pool,
+    ensure_admin_seed, ensure_schema_v2,
+    purge_pristine_seed_hotel,
+)
 from services.cache import get_redis, close_redis
 from scheduler.setup import start_scheduler, stop_scheduler
 from routes.bot import router as bot_router
@@ -78,6 +82,10 @@ async def lifespan(app: FastAPI):
     await get_redis()
     await ensure_schema_v2()
     await ensure_admin_seed()
+    # One-shot cleanup of the legacy "Grand Stay Hotel" seed row that the
+    # old migration.sql Section 7 used to insert on every fresh deploy.
+    # No-op if the row is gone or has been customised.
+    await purge_pristine_seed_hotel()
     await start_scheduler()
     logger.info("✅ HotelFlow is ready!")
     yield

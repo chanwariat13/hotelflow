@@ -202,6 +202,97 @@ async def ensure_admin_seed():
         logger.exception("ensure_admin_seed failed: %s", e)
 
 
+# ── Seed-hotel cleanup ───────────────────────────────────────────────
+# Older versions of migration.sql Section 7 inserted a "Grand Stay Hotel"
+# (slug='grand-stay', instance='Propertybaajar') on every fresh deploy,
+# leaving the master dashboard showing "Active Hotels: 1 of 1" before the
+# operator had added anything. The seed has been removed from migration.sql
+# but existing deployments still have that phantom row, so we purge it on
+# startup — but ONLY when it's still pristine: same name + slug + instance
+# as the original seed AND no associated rooms / bookings / users / services
+# / tickets / channel rows. If the operator repurposed the seed (changed
+# the name, added rooms, etc.) we leave the row alone — even one child
+# record is enough to keep it.
+_SEED_NAME     = "Grand Stay Hotel"
+_SEED_SLUG     = "grand-stay"
+_SEED_INSTANCE = "Propertybaajar"
+
+# Tables that link back to a hotel by hotel_id. If any of these have at
+# least one row for the seed hotel, the seed has been used for real and
+# we MUST NOT delete it.
+_SEED_CHILD_TABLES = (
+    "rooms", "bookings", "stay_charges", "payment_logs",
+    "services", "staff_departments", "service_requests",
+    "additional_booking_guests", "hotel_users",
+    "hotel_food_items", "hotel_food_orders",
+    "maintenance_tickets", "housekeeping_log",
+    "night_audits", "channel_accounts", "channel_room_types",
+    "channel_rate_plans", "channel_inventory", "channel_sync_log",
+    "channel_bookings", "formc_filings",
+)
+
+
+async def purge_pristine_seed_hotel():
+    """
+    Remove the legacy migration.sql seed hotel if (and only if) it is still
+    pristine. Idempotent — safe to call on every startup. Logs at INFO when
+    it removes the row, DEBUG when it refuses (operator has data).
+    """
+    try:
+        row = await fetchrow(
+            "SELECT id, hotel_name, slug, instance_name FROM hotels "
+            "WHERE slug=$1 AND hotel_name=$2 AND instance_name=$3",
+            _SEED_SLUG, _SEED_NAME, _SEED_INSTANCE,
+        )
+        if not row:
+            return  # nothing to clean up
+
+        hid = row["id"]
+
+        # Refuse to delete if any child table has data for this hotel.
+        for tbl in _SEED_CHILD_TABLES:
+            try:
+                cnt = await fetchval(
+                    f"SELECT COUNT(*) FROM {tbl} WHERE hotel_id=$1", hid
+                )
+            except Exception:
+                # Table might not exist on this older deploy — treat as
+                # zero rows rather than aborting the whole cleanup.
+                cnt = 0
+            if cnt and int(cnt) > 0:
+                logger.info(
+                    "Seed hotel id=%s has %s row(s) in '%s'; leaving it in "
+                    "place. Deactivate or rename it via the admin UI if you "
+                    "no longer want it on the dashboard.",
+                    hid, cnt, tbl,
+                )
+                return
+
+        # Also leave it alone if the audit_log already records work against it.
+        try:
+            audit_cnt = await fetchval(
+                "SELECT COUNT(*) FROM audit_log WHERE hotel_id=$1", hid
+            )
+            if audit_cnt and int(audit_cnt) > 0:
+                logger.info(
+                    "Seed hotel id=%s has %s audit_log entr(ies); leaving it "
+                    "in place.", hid, audit_cnt,
+                )
+                return
+        except Exception:
+            pass
+
+        await execute("DELETE FROM hotels WHERE id=$1", hid)
+        logger.info(
+            "Removed pristine legacy seed hotel id=%s (slug='%s'). "
+            "Master dashboard will now show 0 hotels until you add one.",
+            hid, _SEED_SLUG,
+        )
+    except Exception as e:
+        # Cleanup must never block startup.
+        logger.warning("purge_pristine_seed_hotel skipped: %s", e)
+
+
 async def ensure_schema_v2():
     """
     Idempotent schema upgrade. Runs on every startup. Creates new tables and
