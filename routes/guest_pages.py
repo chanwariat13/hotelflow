@@ -1180,3 +1180,359 @@ async def api_food_my_orders(slug: str = "", phone: str = "", token: str = ""):
         d["total"]    = float(d.get("total") or 0)
         out.append(d)
     return JSONResponse({"orders": out})
+
+
+# ══════════════════════════════════════════════════════════════════
+# ONLINE PAYMENT PAGE + APIs
+# /pay/{slug}                        -> branded payment page
+# GET  /api/guest/payment-info       -> balance + payment methods
+# POST /api/guest/create-razorpay-order  -> create Razorpay order
+# POST /api/guest/verify-razorpay-payment -> verify + record payment
+# ══════════════════════════════════════════════════════════════════
+
+@router.get("/pay/{slug}", response_class=HTMLResponse)
+async def payment_page(slug: str, request: Request):
+    hotel = await _active_hotel_or_block(slug)
+    pri = safe_color(hotel.get("primary_color"), "#c8a84b")
+    body = f"""
+<div class="card"><div class="ct">💳 Online Payment</div>
+  <p style="font-size:13px;opacity:.65">Loading payment details...</p>
+  <div id="loading" style="text-align:center;padding:20px;font-size:13px;opacity:.6">Please wait...</div>
+</div>
+<div id="paymentContent" style="display:none">
+  <div class="card" id="billSummary">
+    <div class="ct">📋 Bill Summary</div>
+    <div id="chargesList"></div>
+    <div id="balanceDue" style="font-weight:700;margin-top:12px;color:{pri};font-size:16px"></div>
+  </div>
+  <div id="razorpaySection" style="display:none" class="card">
+    <div class="ct">💳 Pay Online (Razorpay)</div>
+    <p style="font-size:12px;opacity:.6;margin-bottom:10px">Secure payment via Razorpay. Cards, UPI, Net Banking accepted.</p>
+    <button class="btn" id="rzpBtn" onclick="initiateRazorpay()">Pay Online</button>
+  </div>
+  <div id="upiSection" style="display:none" class="card">
+    <div class="ct">📱 Pay via UPI QR</div>
+    <p style="font-size:12px;opacity:.6;margin-bottom:10px">Scan with any UPI app (GPay, PhonePe, Paytm). Staff will confirm receipt.</p>
+    <div style="text-align:center"><img id="upiQrImg" style="max-width:280px;border-radius:10px;margin:10px auto"></div>
+  </div>
+  <div id="paidSection" style="display:none" class="card">
+    <div style="font-size:48px;margin-bottom:12px;text-align:center">✅</div>
+    <h3 style="color:{pri};text-align:center">Payment Confirmed!</h3>
+    <p style="opacity:.7;margin-top:8px;text-align:center">Thank you for your payment.</p>
+  </div>
+</div>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script>
+const SLUG={json.dumps(slug)};
+const PARAMS=new URLSearchParams(window.location.search);
+const PHONE=PARAMS.get('phone')||'';
+const BID=PARAMS.get('booking_id')||'';
+const TOKEN=PARAMS.get('token')||PARAMS.get('t')||'';
+let payInfo=null;
+
+async function loadPaymentInfo(){{
+  try{{
+    const r=await fetch('/api/guest/payment-info?slug='+encodeURIComponent(SLUG)+
+      '&phone='+encodeURIComponent(PHONE)+'&booking_id='+encodeURIComponent(BID)+
+      '&token='+encodeURIComponent(TOKEN));
+    const d=await r.json();
+    if(!d.success){{
+      document.getElementById('loading').textContent=d.error||'Unable to load payment info.';
+      return;
+    }}
+    payInfo=d;
+    renderPayment(d);
+  }}catch(e){{
+    document.getElementById('loading').textContent='Network error. Please try again.';
+  }}
+}}
+
+function renderPayment(d){{
+  document.getElementById('loading').style.display='none';
+  document.getElementById('paymentContent').style.display='block';
+  let h='';
+  (d.charges||[]).forEach(c=>{{
+    h+=`<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.07);font-size:13px">
+      <span>${{c.description||c.service_type}}</span><span>₹${{parseFloat(c.amount).toFixed(0)}}</span></div>`;
+  }});
+  document.getElementById('chargesList').innerHTML=h;
+  document.getElementById('balanceDue').textContent='Balance Due: ₹'+parseFloat(d.balance_due).toFixed(0);
+  if(d.balance_due<=0){{
+    document.getElementById('paidSection').style.display='block';
+    return;
+  }}
+  const methods=d.payment_methods||[];
+  if(methods.includes('razorpay')&&d.razorpay_key_id){{
+    document.getElementById('razorpaySection').style.display='block';
+  }}
+  if(methods.includes('upi_qr')&&d.upi_qr_url){{
+    document.getElementById('upiSection').style.display='block';
+    document.getElementById('upiQrImg').src=d.upi_qr_url;
+  }}
+}}
+
+async function initiateRazorpay(){{
+  const btn=document.getElementById('rzpBtn');
+  btn.disabled=true;btn.textContent='Processing...';
+  try{{
+    const r=await fetch('/api/guest/create-razorpay-order',{{method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{slug:SLUG,phone:PHONE,booking_id:BID,token:TOKEN}})}});
+    const d=await r.json();
+    if(!d.success){{
+      showToast(d.error||'Could not create order',false);
+      btn.disabled=false;btn.textContent='Pay Online';
+      return;
+    }}
+    const options={{
+      key:d.key_id,
+      amount:d.amount,
+      currency:d.currency||'INR',
+      name:d.hotel_name||'Hotel',
+      description:d.description||'Hotel Payment',
+      order_id:d.order_id,
+      handler:async function(response){{
+        await verifyPayment(response);
+      }},
+      modal:{{ondismiss:function(){{btn.disabled=false;btn.textContent='Pay Online';}}}}
+    }};
+    const rzp=new Razorpay(options);
+    rzp.open();
+  }}catch(e){{
+    showToast('Network error',false);
+    btn.disabled=false;btn.textContent='Pay Online';
+  }}
+}}
+
+async function verifyPayment(response){{
+  try{{
+    const r=await fetch('/api/guest/verify-razorpay-payment',{{method:'POST',
+      headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{slug:SLUG,phone:PHONE,booking_id:BID,token:TOKEN,
+        razorpay_order_id:response.razorpay_order_id,
+        razorpay_payment_id:response.razorpay_payment_id,
+        razorpay_signature:response.razorpay_signature}})}});
+    const d=await r.json();
+    if(d.success){{
+      document.getElementById('razorpaySection').style.display='none';
+      document.getElementById('upiSection').style.display='none';
+      document.getElementById('paidSection').style.display='block';
+      document.getElementById('balanceDue').textContent='Balance Due: ₹0';
+      document.getElementById('balanceDue').style.color='#3fb950';
+      showToast('Payment confirmed!');
+    }}else{{
+      showToast(d.error||'Verification failed',false);
+      document.getElementById('rzpBtn').disabled=false;
+      document.getElementById('rzpBtn').textContent='Pay Online';
+    }}
+  }}catch(e){{
+    showToast('Network error during verification',false);
+    document.getElementById('rzpBtn').disabled=false;
+    document.getElementById('rzpBtn').textContent='Pay Online';
+  }}
+}}
+
+loadPaymentInfo();
+</script>"""
+    return HTMLResponse(themed(hotel, "Online Payment", body))
+
+
+@router.get("/api/guest/payment-info")
+async def api_payment_info(
+    slug: str = "", phone: str = "", booking_id: str = "", token: str = ""
+):
+    """Return balance due and available payment methods for an authenticated guest session."""
+    if not slug or not phone:
+        return JSONResponse({"success": False, "error": "Missing parameters"}, 400)
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        return JSONResponse({"success": False, "error": "Hotel not found"}, 404)
+    if not hotel.get("is_active"):
+        return JSONResponse({"success": False, "error": "Hotel unavailable"}, 503)
+
+    state, _ = await _get_guest_token_session(phone.strip(), token)
+    if state in ("bad", "none"):
+        return JSONResponse({"success": False, "error": "Invalid session"}, 403)
+
+    hid = hotel["id"]
+    bk = await db.get_active_booking_by_phone(phone.strip(), hid)
+    if not bk:
+        return JSONResponse({"success": False, "error": "No active booking found"})
+    if booking_id and booking_id != bk["booking_id"]:
+        return JSONResponse({"success": False, "error": "Booking mismatch"}, 403)
+
+    charges = await db.fetch(
+        "SELECT id, service_type, description, amount, total, payment_status "
+        "FROM stay_charges WHERE booking_id=$1 AND hotel_id=$2 AND payment_status='Pending'",
+        bk["booking_id"], hid,
+    )
+    balance = sum(float(c.get("total") or c.get("amount") or 0) for c in charges)
+
+    # Determine payment methods
+    pay_mode = (hotel.get("payment_mode") or "razorpay").lower()
+    if pay_mode == "upi_qr":
+        methods = ["upi_qr"]
+    elif pay_mode == "both":
+        methods = ["razorpay", "upi_qr"]
+    else:
+        methods = ["razorpay"]
+
+    # Build UPI QR URL if applicable
+    upi_qr_url = ""
+    if "upi_qr" in methods and hotel.get("upi_id"):
+        from services.payment import generate_upi_qr_url
+        upi_name = hotel.get("upi_display_name") or hotel.get("hotel_name", "Hotel")
+        upi_qr_url = generate_upi_qr_url(
+            hotel["upi_id"], upi_name, balance, bk["booking_id"]
+        )
+
+    return JSONResponse({
+        "success": True,
+        "payment_methods": methods,
+        "balance_due": balance,
+        "charges": [
+            {"description": c.get("description", ""), "amount": float(c.get("total") or c.get("amount") or 0),
+             "service_type": c.get("service_type", "")}
+            for c in charges
+        ],
+        "hotel_name": hotel.get("hotel_name", ""),
+        "booking_id": bk["booking_id"],
+        "room_number": bk.get("room_number", ""),
+        "upi_qr_url": upi_qr_url,
+        "razorpay_key_id": hotel.get("razorpay_key_id", "") if "razorpay" in methods else "",
+    })
+
+
+@router.post("/api/guest/create-razorpay-order")
+async def api_create_razorpay_order(request: Request):
+    """Create a Razorpay order for the guest's pending balance."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON"}, 400)
+
+    slug = body.get("slug", "")
+    phone = (body.get("phone") or "").strip()
+    booking_id = (body.get("booking_id") or "").strip()
+    token = (body.get("token") or "").strip()
+
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        return JSONResponse({"success": False, "error": "Hotel not found"}, 404)
+
+    state, _ = await _get_guest_token_session(phone, token)
+    if state in ("bad", "none"):
+        return JSONResponse({"success": False, "error": "Invalid session"}, 403)
+
+    hid = hotel["id"]
+    bk = await db.get_active_booking_by_phone(phone, hid)
+    if not bk:
+        return JSONResponse({"success": False, "error": "No active booking"})
+    if booking_id and booking_id != bk["booking_id"]:
+        return JSONResponse({"success": False, "error": "Booking mismatch"}, 403)
+
+    balance = await db.get_balance_due(bk["booking_id"], hotel_id=hid)
+    if balance <= 0:
+        return JSONResponse({"success": False, "error": "No pending balance"})
+
+    creds = await db.get_razorpay_creds(hid) or {}
+    key_id = (creds.get("razorpay_key_id") or "").strip()
+    key_secret = (creds.get("razorpay_secret") or "").strip()
+    if not key_id or not key_secret:
+        return JSONResponse({"success": False, "error": "Online payment not configured"})
+
+    from services.payment import create_razorpay_order
+    amount_paise = int(balance * 100)
+    order = await create_razorpay_order(
+        key_id, key_secret, amount_paise,
+        receipt=bk["booking_id"],
+        notes={"booking_id": bk["booking_id"], "phone": phone, "room": bk.get("room_number", "")},
+    )
+    if not order:
+        return JSONResponse({"success": False, "error": "Could not create payment order"})
+
+    return JSONResponse({
+        "success": True,
+        "order_id": order.get("id", ""),
+        "amount": amount_paise,
+        "key_id": key_id,
+        "currency": "INR",
+        "hotel_name": hotel.get("hotel_name", ""),
+        "description": f"Hotel Stay - Room {bk.get('room_number', '')}",
+    })
+
+
+@router.post("/api/guest/verify-razorpay-payment")
+async def api_verify_razorpay_payment(request: Request):
+    """Verify Razorpay payment signature and record the payment."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": "Invalid JSON"}, 400)
+
+    slug = body.get("slug", "")
+    phone = (body.get("phone") or "").strip()
+    booking_id = (body.get("booking_id") or "").strip()
+    token = (body.get("token") or "").strip()
+    rz_order_id = (body.get("razorpay_order_id") or "").strip()
+    rz_payment_id = (body.get("razorpay_payment_id") or "").strip()
+    rz_signature = (body.get("razorpay_signature") or "").strip()
+
+    if not rz_order_id or not rz_payment_id or not rz_signature:
+        return JSONResponse({"success": False, "error": "Missing payment details"}, 400)
+
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        return JSONResponse({"success": False, "error": "Hotel not found"}, 404)
+
+    state, _ = await _get_guest_token_session(phone, token)
+    if state in ("bad", "none"):
+        return JSONResponse({"success": False, "error": "Invalid session"}, 403)
+
+    hid = hotel["id"]
+    bk = await db.get_active_booking_by_phone(phone, hid)
+    if not bk:
+        return JSONResponse({"success": False, "error": "No active booking"})
+    if booking_id and booking_id != bk["booking_id"]:
+        return JSONResponse({"success": False, "error": "Booking mismatch"}, 403)
+
+    creds = await db.get_razorpay_creds(hid) or {}
+    key_secret = (creds.get("razorpay_secret") or "").strip()
+    if not key_secret:
+        return JSONResponse({"success": False, "error": "Payment not configured"})
+
+    from services.payment import verify_razorpay_payment_signature
+    if not verify_razorpay_payment_signature(rz_order_id, rz_payment_id, rz_signature, key_secret):
+        return JSONResponse({"success": False, "error": "Payment verification failed"}, 400)
+
+    # Record the payment
+    balance = await db.get_balance_due(bk["booking_id"], hotel_id=hid)
+    bid = bk["booking_id"]
+    room = bk.get("room_number", "")
+    name = bk.get("guest_name", "")
+
+    await db.insert_payment_log({
+        "booking_id": bid,
+        "guest_phone": phone,
+        "room_number": room,
+        "guest_name": name,
+        "amount": balance,
+        "payment_method": "Online",
+        "reference": rz_payment_id,
+        "hotel_id": hid,
+    })
+    await db.mark_charges_paid(bid, "Online", rz_payment_id, hotel_id=hid)
+    await db.execute(
+        "UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2 AND hotel_id=$3",
+        balance, bid, hid,
+    )
+
+    # Notify guest via WhatsApp
+    try:
+        await send_text(hotel["instance_name"], phone,
+            f"✅ *Payment Confirmed!*\n💰 ₹{balance:.0f} received online.\n"
+            f"🏨 Room: {room}\nThank you! 🙏")
+    except Exception:
+        pass
+
+    return JSONResponse({"success": True, "message": "Payment confirmed"})

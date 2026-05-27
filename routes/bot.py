@@ -642,12 +642,22 @@ async def do_razorpay(phone, room, bid, name, hotel, instance, hid):
     secret = creds.get("razorpay_secret", "") or ""
     if not key_id: await send_text(instance, phone, "⚠️ Online payment not configured. Please pay cash or UPI."); return
     link = await create_razorpay_link(key_id, secret, bal, f"Hotel Stay - Room {room} - {bid}", phone)
+    # Build web payment page link
+    from config.settings import BASE_URL
+    slug = hotel.get("slug", "")
+    sess = await get_session(phone)
+    guest_token = sess.get("guest_token", "") if sess else ""
+    pay_url = f"{BASE_URL}/pay/{slug}?booking_id={bid}&phone={phone}&token={guest_token}"
     if link:
         await send_text(instance, phone,
             f"💳 *Online Payment*\n━━━━━━━━━━━━━━━━━━\n🏨 Room: *{room}*\n"
-            f"💰 Amount: *₹{bal:.0f}*\n\n🔗 Pay securely:\n{link}\n\n✅ Powered by Razorpay.")
+            f"💰 Amount: *₹{bal:.0f}*\n\n🔗 Pay securely:\n{link}\n\n"
+            f"Or pay via web: {pay_url}\n\n✅ Powered by Razorpay.")
     else:
-        await send_text(instance, phone, "⚠️ Could not generate link. Please contact reception.")
+        await send_text(instance, phone,
+            f"💳 *Online Payment*\n━━━━━━━━━━━━━━━━━━\n🏨 Room: *{room}*\n"
+            f"💰 Amount: *₹{bal:.0f}*\n\n🔗 Pay via web: {pay_url}\n\n"
+            f"⚠️ Could not generate direct link. Use the web page above.")
 
 async def do_upi(phone, room, bid, name, hotel, instance, hid):
     bal = await db.get_balance_due(bid, hotel_id=hid)
@@ -655,9 +665,16 @@ async def do_upi(phone, room, bid, name, hotel, instance, hid):
     upi_id = hotel.get("upi_id",""); upi_name = hotel.get("upi_display_name","") or hotel.get("hotel_name","Hotel")
     if not upi_id: await send_text(instance, phone, "⚠️ UPI not configured. Please pay cash."); return
     qr_b64 = await fetch_upi_qr(upi_id, upi_name, bal, room, bid)
+    # Build web payment page link
+    from config.settings import BASE_URL
+    slug = hotel.get("slug", "")
+    sess = await get_session(phone)
+    guest_token = sess.get("guest_token", "") if sess else ""
+    pay_url = f"{BASE_URL}/pay/{slug}?booking_id={bid}&phone={phone}&token={guest_token}"
     msg = (f"💳 *UPI Payment QR*\n━━━━━━━━━━━━━━━━━━\n🏨 Room: *{room}*\n💰 Amount: *₹{bal:.0f}*\n\n"
            f"📱 Screenshot & scan in GPay/PhonePe/Paytm\n\n"
-           f"⚠️ Please pay at reception in front of staff.\nStaff confirms when soundbox says 'Payment Received'")
+           f"⚠️ Please pay at reception in front of staff.\nStaff confirms when soundbox says 'Payment Received'\n\n"
+           f"Or pay via web: {pay_url}")
     if qr_b64: await send_image_b64(instance, phone, qr_b64, msg)
     else: await send_text(instance, phone, msg)
     staff_phones = await db.get_staff_phones(hid)

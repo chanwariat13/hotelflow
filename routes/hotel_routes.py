@@ -481,6 +481,69 @@ async def reject_checkin(slug: str, bid: str, request: Request):
 
 
 
+# ── Payment settings (read-only, non-secret) ──────────────────────
+@router.get("/{slug}/payment-settings")
+async def payment_settings(slug: str, request: Request):
+    await require_hotel_access(request, slug)
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    return JSONResponse({
+        "payment_mode": hotel.get("payment_mode", "razorpay"),
+        "razorpay_key_id": hotel.get("razorpay_key_id", ""),
+        "razorpay_configured": bool(hotel.get("razorpay_key_id") and hotel.get("razorpay_secret")),
+        "upi_id": hotel.get("upi_id", ""),
+        "upi_display_name": hotel.get("upi_display_name", ""),
+        "upi_configured": bool(hotel.get("upi_id")),
+    })
+
+# ── Confirm UPI payment (staff endpoint) ──────────────────────────
+@router.post("/{slug}/confirm-upi-payment")
+async def confirm_upi_payment(slug: str, request: Request):
+    """Staff confirms a UPI payment was received (e.g. soundbox notification)."""
+    await require_hotel_access(request, slug)
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel: raise HTTPException(404)
+    hid = hotel["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    booking_id = (body.get("booking_id") or "").strip()
+    amount = float(body.get("amount") or 0)
+    if not booking_id or amount <= 0:
+        raise HTTPException(400, "booking_id and positive amount required")
+    bk = await db.get_booking_by_id(booking_id, hotel_id=hid)
+    if not bk:
+        raise HTTPException(404, "Booking not found")
+    phone = bk.get("guest_phone", "")
+    room = bk.get("room_number", "")
+    name = bk.get("guest_name", "")
+    await db.insert_payment_log({
+        "booking_id": booking_id,
+        "guest_phone": phone,
+        "room_number": room,
+        "guest_name": name,
+        "amount": amount,
+        "payment_method": "UPI",
+        "reference": "UPI-STAFF-CONFIRM",
+        "hotel_id": hid,
+    })
+    await db.mark_charges_paid(booking_id, "UPI", "UPI-STAFF-CONFIRM", hotel_id=hid)
+    await db.execute(
+        "UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2 AND hotel_id=$3",
+        amount, booking_id, hid,
+    )
+    # Notify guest
+    try:
+        from services.whatsapp import send_text
+        await send_text(hotel["instance_name"], phone,
+            f"✅ *UPI Payment Confirmed!*\n💰 ₹{amount:.0f} received.\n"
+            f"🏨 Room: {room}\nThank you! 🙏")
+    except Exception:
+        pass
+    return JSONResponse({"success": True, "message": "UPI payment confirmed"})
+
+
 # ══════════════════════════════════════════════════════════════════
 # REAL FOOD / RESTAURANT MODULE — per-hotel endpoints
 # The hotel owner / manager uses these from their dashboard. The menu they
