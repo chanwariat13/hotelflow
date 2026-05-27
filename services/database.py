@@ -1746,7 +1746,8 @@ async def lookup_guest_by_phone(phone: str, hotel_id: Optional[int] = None) -> O
     if hotel_id is None:
         logger.warning("lookup_guest_by_phone called without hotel_id (phone=%s)", phone)
         return await fetchrow("""
-            SELECT b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
+            SELECT b.id AS id,
+              b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
               b.id_proof_photo,b.id_proof_photo_back,b.guest_count,
               COUNT(*) OVER() AS total_visits,
               COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Paid'),0) AS total_spent,
@@ -1754,7 +1755,8 @@ async def lookup_guest_by_phone(phone: str, hotel_id: Optional[int] = None) -> O
             FROM bookings b LEFT JOIN stay_charges sc ON sc.booking_id=b.booking_id
             WHERE b.guest_phone=$1 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""", phone)
     return await fetchrow("""
-        SELECT b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
+        SELECT b.id AS id,
+          b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
           b.id_proof_photo,b.id_proof_photo_back,b.guest_count,
           COUNT(*) OVER() AS total_visits,
           COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Paid'),0) AS total_spent,
@@ -1768,11 +1770,13 @@ async def lookup_guest_by_id(id_num: str, hotel_id: Optional[int] = None) -> Opt
     if hotel_id is None:
         logger.warning("lookup_guest_by_id called without hotel_id (id_num=%s)", id_num)
         return await fetchrow("""
-            SELECT b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
+            SELECT b.id AS id,
+              b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
               b.id_proof_photo,b.id_proof_photo_back,b.guest_count,MAX(b.checkin_date) AS last_checkin
             FROM bookings b WHERE b.id_proof_number=$1 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""", id_num)
     return await fetchrow("""
-        SELECT b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
+        SELECT b.id AS id,
+          b.guest_name,b.guest_phone,b.alternate_phone,b.id_proof_type,b.id_proof_number,
           b.id_proof_photo,b.id_proof_photo_back,b.guest_count,MAX(b.checkin_date) AS last_checkin
         FROM bookings b WHERE b.id_proof_number=$1 AND b.hotel_id=$2 GROUP BY b.id ORDER BY last_checkin DESC LIMIT 1""",
         id_num, hotel_id)
