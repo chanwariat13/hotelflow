@@ -4,10 +4,17 @@ Each hotel: /api/hotel/{slug}/*
 Permissions enforced per role. Zero hardcoding.
 """
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from services import database as db
 from services.auth import require_hotel_access, require_perm
 from services.cache import get_room as cache_room, delete_session, delete_room, delete_pending
+from services.cloudinary_signing import (
+    verify_id_proof_token,
+    is_cloudinary_url,
+    wrap_booking_id_proofs,
+    wrap_additional_guest_id_proofs,
+    wrap_guest_lookup_id_proofs,
+)
 
 router = APIRouter(prefix="/api/hotel")
 
@@ -109,7 +116,90 @@ async def hotel_booking_detail(slug: str, bid: str, request: Request):
         for ag in extra:
             ag["id_proof_photo"] = "🔒 Hidden"
             ag["id_proof_photo_back"] = "🔒 Hidden"
+    # Replace any remaining real Cloudinary URLs with short-lived signed proxy
+    # URLs so a leaked link expires in ~10 minutes and permission is re-checked
+    # at fetch time. The "🔒 Hidden" sentinel above is preserved by the wrappers.
+    wrap_booking_id_proofs(bk, slug)
+    for ag in extra:
+        wrap_additional_guest_id_proofs(ag, slug)
     return JSONResponse({"booking": bk, "charges": charges, "additional_guests": extra})
+
+# ── ID-proof photo proxy (signed, short-lived) ────────────────────
+@router.get("/{slug}/id-proof/{token}")
+async def fetch_id_proof(slug: str, token: str, request: Request):
+    """Resolve a signed ID-proof token to the actual Cloudinary URL.
+
+    Frontend never sees `https://res.cloudinary.com/...` directly anymore —
+    every endpoint that used to emit that URL now emits a path of the form
+    `/api/hotel/{slug}/id-proof/{token}` whose token expires in ~10 minutes.
+    See `services/cloudinary_signing` for the token format and rationale.
+
+    Defense-in-depth checks (in this order, fail-closed):
+      1. Caller has a valid hotel session AND `can_view_id_proofs` for `slug`.
+         Permission is re-checked HERE — at fetch time — so revoking
+         `can_view_id_proofs` instantly invalidates already-issued tokens
+         instead of waiting for them to expire naturally.
+      2. Token signature is valid and not expired.
+      3. The token's row belongs to THIS hotel (blocks cross-tenant access
+         even if a token leaks between hotels — e.g. a manager who works at
+         hotel A and B and has tokens for both in the same browser).
+      4. The stored URL points at Cloudinary (allow-list). Without this the
+         endpoint would be an open redirect — an attacker who somehow stored
+         `https://evil.example/...` in `id_proof_photo` could use a valid
+         staff session to redirect logged-in browsers.
+
+    On success: 302 to Cloudinary with `Cache-Control: private, no-store` so
+    intermediaries don't cache the redirect target.
+    """
+    user = await require_perm(request, slug, "can_view_id_proofs")
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        raise HTTPException(404)
+
+    payload = verify_id_proof_token(token)
+    if not payload:
+        # Same response for forged / expired / malformed — don't help an
+        # attacker distinguish those cases.
+        raise HTTPException(403, "Invalid or expired ID-proof token")
+
+    # Resolve the row. We fetch only the columns we need so a row that has
+    # other sensitive data isn't touched.
+    if payload["kind"] == "b":
+        row = await db.fetchrow(
+            "SELECT id, hotel_id, id_proof_photo, id_proof_photo_back "
+            "FROM bookings WHERE id=$1",
+            payload["row_id"],
+        )
+    else:  # "a" — additional_booking_guests
+        row = await db.fetchrow(
+            "SELECT id, hotel_id, id_proof_photo, id_proof_photo_back "
+            "FROM additional_booking_guests WHERE id=$1",
+            payload["row_id"],
+        )
+    if not row:
+        raise HTTPException(404, "Photo not found")
+
+    # Tenant scope re-check. Even with a valid signature + permission, the
+    # token must point at a row owned by THIS hotel. Without this, a manager
+    # with `can_view_id_proofs` at hotel A could swap the slug in the URL
+    # to hotel B and still resolve A's tokens.
+    if int(row["hotel_id"]) != int(hotel["id"]):
+        raise HTTPException(403, "Cross-tenant access denied")
+
+    col = "id_proof_photo" if payload["which"] == "f" else "id_proof_photo_back"
+    url = (row.get(col) or "").strip()
+    if not url:
+        raise HTTPException(404, "No photo on this row")
+
+    # Open-redirect guard. We only ever stored Cloudinary URLs (the upload
+    # path in `routes/guest_pages` POSTs to `api.cloudinary.com` and stores
+    # `secure_url` from the response), so anything else is suspicious.
+    if not is_cloudinary_url(url):
+        raise HTTPException(502, "Refusing to redirect to non-Cloudinary URL")
+
+    resp = RedirectResponse(url, status_code=302)
+    resp.headers["Cache-Control"] = "private, no-store"
+    return resp
 
 # ── Revenue (owner/manager only) ──────────────────────────────────
 @router.get("/{slug}/revenue/today")
@@ -287,7 +377,7 @@ async def broadcast(slug: str, request: Request):
 # ── Guest lookup ───────────────────────────────────────────────────
 @router.get("/{slug}/guests/search")
 async def search_guest(slug: str, request: Request):
-    await require_hotel_access(request, slug)
+    user = await require_hotel_access(request, slug)
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel:
         raise HTTPException(404)
@@ -304,7 +394,19 @@ async def search_guest(slug: str, request: Request):
         await db.lookup_guest_by_id(id_num, hotel_id=hotel["id"])
     )
     if not guest: return JSONResponse({"found": False})
-    return JSONResponse({"found": True, "guest": guest})
+    # Same permission gate as the booking detail endpoint: staff without
+    # `can_view_id_proofs` can still look up name / phone / visit count
+    # (legitimate operational need at reception) but the photo URLs are
+    # masked. Previously this endpoint exposed them to every hotel user
+    # regardless of permission — silent gap, fixed here.
+    guest_dict = dict(guest)  # asyncpg Records are immutable; we mutate this
+    if not user.get("can_view_id_proofs") and user.get("role") != "superadmin":
+        guest_dict["id_proof_photo"] = "🔒 Hidden"
+        guest_dict["id_proof_photo_back"] = "🔒 Hidden"
+    # Sign any remaining real URLs (`b.id AS id` is selected by the lookup
+    # query so the wrapper has the row id it needs).
+    wrap_guest_lookup_id_proofs(guest_dict, slug)
+    return JSONResponse({"found": True, "guest": guest_dict})
 
 # ── QR Code generator ─────────────────────────────────────────────
 @router.get("/{slug}/rooms/{room_number}/qr")

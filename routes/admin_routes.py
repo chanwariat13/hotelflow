@@ -8,6 +8,7 @@ from services import database as db
 from services.auth import require_superadmin
 from services.audit import audit, list_audit
 from services.cache import get_room as cache_room
+from services.cloudinary_signing import wrap_booking_id_proofs
 import json
 import logging
 import secrets
@@ -332,6 +333,15 @@ async def all_bookings(request: Request):
         bks = await db.get_bookings_list(hid, status or None, limit)
     else:
         bks = await db.fetch("SELECT b.*,COALESCE(SUM(sc.total) FILTER(WHERE sc.payment_status='Pending'),0) AS balance_due FROM bookings b LEFT JOIN stay_charges sc ON sc.booking_id=b.booking_id GROUP BY b.id ORDER BY b.created_at DESC LIMIT $1", limit)
+    # Sign ID-proof URLs so superadmin tokens also expire in 10 minutes
+    # and route through the proxy. Build a {hotel_id -> slug} lookup once
+    # because rows here can span multiple hotels (when hid==0).
+    bks = [dict(b) for b in bks]
+    slug_by_hid = {h["id"]: h["slug"] for h in await db.get_all_hotels()}
+    for b in bks:
+        slug = slug_by_hid.get(b.get("hotel_id"))
+        if slug:
+            wrap_booking_id_proofs(b, slug)
     return JSONResponse({"bookings": bks})
 
 @router.put("/password")
