@@ -13,9 +13,9 @@ import httpx
 def generate_upi_qr_url(upi_id: str, upi_name: str, amount: float, reference: str) -> str:
     """Build a QR code URL via qrserver.com that encodes a UPI deep link."""
     upi_link = (
-        f"upi://pay?pa={upi_id}"
+        f"upi://pay?pa={urllib.parse.quote(upi_id)}"
         f"&pn={urllib.parse.quote(upi_name)}"
-        f"&am={amount}"
+        f"&am={amount:.2f}"
         f"&tn={urllib.parse.quote(reference)}"
         f"&cu=INR"
     )
@@ -56,10 +56,15 @@ def verify_razorpay_payment_signature(
     order_id: str, payment_id: str, signature: str, key_secret: str
 ) -> bool:
     """Verify the Razorpay checkout signature using HMAC-SHA256."""
-    message = f"{order_id}|{payment_id}"
-    expected = hmac.new(
-        key_secret.encode("utf-8"),
-        message.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+    if not order_id or not payment_id or not signature or not key_secret:
+        return False
+    try:
+        message = f"{order_id}|{payment_id}"
+        expected = hmac.new(
+            key_secret.encode("utf-8"),
+            message.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
+    except Exception:
+        return False

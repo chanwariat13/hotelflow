@@ -1451,9 +1451,19 @@ async def api_create_razorpay_order(request: Request):
     if not order:
         return JSONResponse({"success": False, "error": "Could not create payment order"})
 
+    # Store the razorpay_order_id on pending charges so we can track which
+    # order covers them and use the amount at verification time.
+    rz_order_id = order.get("id", "")
+    if rz_order_id:
+        await db.execute(
+            "UPDATE stay_charges SET razorpay_order_id=$1 "
+            "WHERE booking_id=$2 AND hotel_id=$3 AND payment_status='Pending'",
+            rz_order_id, bk["booking_id"], hid,
+        )
+
     return JSONResponse({
         "success": True,
-        "order_id": order.get("id", ""),
+        "order_id": rz_order_id,
         "amount": amount_paise,
         "key_id": key_id,
         "currency": "INR",
@@ -1496,6 +1506,14 @@ async def api_verify_razorpay_payment(request: Request):
     if booking_id and booking_id != bk["booking_id"]:
         return JSONResponse({"success": False, "error": "Booking mismatch"}, 403)
 
+    # Idempotency: check if this razorpay_payment_id was already recorded
+    existing = await db.fetchval(
+        "SELECT id FROM payment_logs WHERE reference=$1 AND hotel_id=$2 LIMIT 1",
+        rz_payment_id, hid,
+    )
+    if existing:
+        return JSONResponse({"success": True, "message": "Payment already recorded"})
+
     creds = await db.get_razorpay_creds(hid) or {}
     key_secret = (creds.get("razorpay_secret") or "").strip()
     if not key_secret:
@@ -1505,32 +1523,49 @@ async def api_verify_razorpay_payment(request: Request):
     if not verify_razorpay_payment_signature(rz_order_id, rz_payment_id, rz_signature, key_secret):
         return JSONResponse({"success": False, "error": "Payment verification failed"}, 400)
 
-    # Record the payment
-    balance = await db.get_balance_due(bk["booking_id"], hotel_id=hid)
+    # Use the amount from the Razorpay order (stored at creation time) rather
+    # than recomputing balance, which may have changed if charges were added
+    # between order creation and verification.
     bid = bk["booking_id"]
     room = bk.get("room_number", "")
     name = bk.get("guest_name", "")
+
+    # Sum up amounts from charges tied to this razorpay_order_id
+    order_amount = await db.fetchval(
+        "SELECT COALESCE(SUM(total), 0) FROM stay_charges "
+        "WHERE booking_id=$1 AND hotel_id=$2 AND razorpay_order_id=$3 AND payment_status='Pending'",
+        bid, hid, rz_order_id,
+    )
+    # Fallback: if no charges are tagged (legacy), use the current balance
+    if not order_amount or float(order_amount) <= 0:
+        order_amount = await db.get_balance_due(bid, hotel_id=hid)
+    amount = float(order_amount)
 
     await db.insert_payment_log({
         "booking_id": bid,
         "guest_phone": phone,
         "room_number": room,
         "guest_name": name,
-        "amount": balance,
+        "amount": amount,
         "payment_method": "Online",
         "reference": rz_payment_id,
         "hotel_id": hid,
     })
-    await db.mark_charges_paid(bid, "Online", rz_payment_id, hotel_id=hid)
+    # Mark the specific charges tied to this order as paid and set razorpay_order_id
+    await db.execute(
+        "UPDATE stay_charges SET payment_status='Paid', razorpay_order_id=$1 "
+        "WHERE booking_id=$2 AND hotel_id=$3 AND razorpay_order_id=$1 AND payment_status='Pending'",
+        rz_order_id, bid, hid,
+    )
     await db.execute(
         "UPDATE bookings SET total_paid=total_paid+$1,updated_at=NOW() WHERE booking_id=$2 AND hotel_id=$3",
-        balance, bid, hid,
+        amount, bid, hid,
     )
 
     # Notify guest via WhatsApp
     try:
         await send_text(hotel["instance_name"], phone,
-            f"✅ *Payment Confirmed!*\n💰 ₹{balance:.0f} received online.\n"
+            f"✅ *Payment Confirmed!*\n💰 ₹{amount:.0f} received online.\n"
             f"🏨 Room: {room}\nThank you! 🙏")
     except Exception:
         pass
