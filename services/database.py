@@ -873,6 +873,9 @@ async def ensure_schema_v2():
         await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ota_source     VARCHAR(60) DEFAULT ''")
         await execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS channel_ref    VARCHAR(120) DEFAULT ''")
 
+        # Online payment tracking
+        await execute("ALTER TABLE stay_charges ADD COLUMN IF NOT EXISTS razorpay_order_id VARCHAR(60) DEFAULT ''")
+
         logger.info("✅ schema_v2 ensured (audit_log, housekeeping, maintenance, food, formc, night_audits, channel_manager)")
     except Exception as e:
         logger.exception("ensure_schema_v2 failed: %s", e)
