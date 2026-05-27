@@ -59,6 +59,13 @@ async def create_hotel(request: Request):
             "role": "owner", "username": data["owner_username"],
             "password": data["owner_password"]
         })
+    # Honour the master-admin's inventory_enabled choice. db.create_hotel's
+    # INSERT doesn't list the column (it's an opt-in module added later),
+    # so we patch it on right after creation when the operator asked for
+    # it. Same code path as flipping the toggle from the dashboard later.
+    if bool(data.get("inventory_enabled")):
+        await db.update_hotel(hotel["id"], {"inventory_enabled": True})
+        hotel["inventory_enabled"] = True
     await audit("hotel.create", actor=_actor(user), actor_role="superadmin",
                 hotel_id=hotel["id"], target=str(hotel["id"]),
                 payload={"name": hotel.get("hotel_name"), "slug": hotel.get("slug")},

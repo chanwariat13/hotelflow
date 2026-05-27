@@ -648,3 +648,106 @@ async def hotel_update_food_order(slug: str, order_id: int, request: Request):
         if order.get(k):
             order[k] = order[k].isoformat()
     return JSONResponse({"success": True, "order": order})
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# INVENTORY MODULE (per-hotel)
+# Owners / managers with `can_manage_services` track linen, toiletries,
+# F&B basics, kitchen supplies. Gated by `hotels.inventory_enabled` so
+# properties that don't care about supply tracking never see the tab.
+# ══════════════════════════════════════════════════════════════════
+async def _require_inventory_enabled(slug: str):
+    """Resolve the hotel and refuse the request if the module is off.
+
+    Centralised so every inventory endpoint fails the same way (HTTP 403)
+    instead of one returning an empty list and another throwing 500. The
+    flag flips instantly via the master-admin or hotel-settings PUT, so
+    no cache invalidation is needed.
+    """
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        raise HTTPException(404)
+    if not hotel.get("inventory_enabled"):
+        raise HTTPException(
+            status_code=403,
+            detail="Inventory module is disabled for this hotel",
+        )
+    return hotel
+
+
+def _serialize_inv_row(row: dict) -> dict:
+    """Stringify timestamps + cast numerics so JSONResponse doesn't choke on
+    Decimal/datetime."""
+    if not row:
+        return row
+    out = dict(row)
+    for k in ("created_at", "updated_at"):
+        if out.get(k):
+            try:
+                out[k] = out[k].isoformat()
+            except Exception:
+                out[k] = str(out[k])
+    for k in ("current_stock", "min_threshold", "cost_price"):
+        if out.get(k) is not None:
+            out[k] = float(out[k])
+    return out
+
+
+@router.get("/{slug}/inventory")
+async def hotel_list_inventory(slug: str, request: Request):
+    """List every SKU for this hotel. Anyone with hotel access can read
+    (kitchen / housekeeping staff need to see what's in stock too); only
+    `can_manage_services` can mutate."""
+    await require_hotel_access(request, slug)
+    hotel = await _require_inventory_enabled(slug)
+    items = await db.list_inventory_items(hotel["id"])
+    low = await db.get_low_stock_inventory(hotel["id"])
+    return JSONResponse({
+        "items": [_serialize_inv_row(r) for r in items],
+        "low_stock": [_serialize_inv_row(r) for r in low],
+    })
+
+
+@router.post("/{slug}/inventory")
+async def hotel_create_inventory(slug: str, request: Request):
+    """Create a new inventory row. Duplicate item names per hotel are
+    rejected at the DB level (unique functional index); we surface that
+    as a 409 so the dashboard can prompt the owner to edit instead.
+    """
+    await require_perm(request, slug, "can_manage_services")
+    hotel = await _require_inventory_enabled(slug)
+    data = await request.json()
+    if not (data.get("item_name") or "").strip():
+        raise HTTPException(400, "item_name is required")
+    try:
+        item = await db.create_inventory_item(hotel["id"], data)
+    except Exception as e:
+        # Most-likely cause: UniqueViolation on (hotel_id, LOWER(item_name)).
+        # asyncpg raises a typed exception; we keep the catch broad so any
+        # constraint added later still surfaces a clean 409.
+        if "uq_hinv_hotel_name" in str(e) or "duplicate key" in str(e).lower():
+            raise HTTPException(409, "An inventory item with this name already exists")
+        raise
+    return JSONResponse({"success": True, "item": _serialize_inv_row(item)})
+
+
+@router.put("/{slug}/inventory/{item_id}")
+async def hotel_update_inventory(slug: str, item_id: int, request: Request):
+    await require_perm(request, slug, "can_manage_services")
+    hotel = await _require_inventory_enabled(slug)
+    data = await request.json()
+    item = await db.update_inventory_item(item_id, hotel["id"], data)
+    if not item:
+        raise HTTPException(404, "Inventory item not found in this hotel")
+    return JSONResponse({"success": True, "item": _serialize_inv_row(item)})
+
+
+@router.delete("/{slug}/inventory/{item_id}")
+async def hotel_delete_inventory(slug: str, item_id: int, request: Request):
+    await require_perm(request, slug, "can_manage_services")
+    hotel = await _require_inventory_enabled(slug)
+    deleted = await db.delete_inventory_item(item_id, hotel["id"])
+    if not deleted:
+        raise HTTPException(404, "Inventory item not found in this hotel")
+    return JSONResponse({"success": True})

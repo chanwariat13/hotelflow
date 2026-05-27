@@ -560,3 +560,30 @@ CREATE INDEX IF NOT EXISTS idx_channel_bookings_phone ON channel_bookings(guest_
 
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS ota_source  VARCHAR(60)  DEFAULT '';
 ALTER TABLE bookings ADD COLUMN IF NOT EXISTS channel_ref VARCHAR(120) DEFAULT '';
+
+
+
+-- ════════════════════════════════════════════════════════════════════
+-- INVENTORY MODULE — opt-in per hotel.
+-- Mirrors the schema added programmatically by services/database.py
+-- ensure_schema_v2 so a fresh install seeded only from migration.sql still
+-- has everything the API + bot expect.
+-- ════════════════════════════════════════════════════════════════════
+ALTER TABLE hotels ADD COLUMN IF NOT EXISTS inventory_enabled BOOLEAN DEFAULT FALSE;
+
+CREATE TABLE IF NOT EXISTS hotel_inventory_items (
+    id            SERIAL PRIMARY KEY,
+    hotel_id      INTEGER       NOT NULL,
+    item_name     VARCHAR(150)  NOT NULL,
+    category      VARCHAR(60)   DEFAULT 'General',
+    unit          VARCHAR(20)   DEFAULT 'pcs',
+    current_stock NUMERIC(12,2) DEFAULT 0,
+    min_threshold NUMERIC(12,2) DEFAULT 0,
+    cost_price    NUMERIC(10,2) DEFAULT 0,
+    notes         TEXT          DEFAULT '',
+    created_at    TIMESTAMP     DEFAULT NOW(),
+    updated_at    TIMESTAMP     DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_hinv_hotel ON hotel_inventory_items(hotel_id);
+CREATE INDEX IF NOT EXISTS idx_hinv_low   ON hotel_inventory_items(hotel_id) WHERE current_stock <= min_threshold;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_hinv_hotel_name ON hotel_inventory_items(hotel_id, LOWER(item_name));

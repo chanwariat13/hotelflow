@@ -87,6 +87,7 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02
   <div class="ni" onclick="nav('guests')">👤 Guest Lookup</div>
   <div class="slbl">Manage</div>
   <div class="ni" id="ni-svc" onclick="nav('svc')">🍽️ Services & Prices</div>
+  <div class="ni" id="ni-inv" onclick="nav('inv')">📦 Inventory</div>
   <div class="ni" id="ni-staff" onclick="nav('staff')">👥 Staff & Users</div>
   <div class="ni" id="ni-settings" onclick="nav('settings')">⚙️ Hotel Settings</div>
   <div class="slbl">Insights</div>
@@ -267,6 +268,18 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02
       <div class="fg"><label>Late Checkout Charge ₹</label><input type="number" id="sLC" class="ti" value="500"></div>
     </div>
   </div>
+  <div class="fsec">
+    <div class="ft">📦 Inventory</div>
+    <div class="fgrid">
+      <div class="fg"><label>Track stock for this hotel?</label>
+        <select id="sIE" class="ti">
+          <option value="false">No — hide Inventory tab + WhatsApp stock commands</option>
+          <option value="true">Yes — show Inventory tab + WhatsApp stock commands</option>
+        </select>
+      </div>
+    </div>
+    <p style="color:var(--t2);font-size:12px;margin:0">When enabled, owners and managers can add linen / toiletries / F&amp;B basics from the Inventory tab and via WhatsApp commands like <code>STOCK</code>, <code>ADD STOCK Pillows: 20 pcs min 5</code>.</p>
+  </div>
   <button class="btn bg" onclick="saveSettings()">💾 Save All Settings</button>
   <span id="savedMsg" style="color:#3fb950;font-size:13px;margin-left:12px;display:none">✓ Saved!</span>
 </div>
@@ -379,6 +392,39 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.02
   </div>
 </div>
 
+<!-- INVENTORY -->
+<div id="pg-inv" class="pg">
+  <h2 class="ptitle">📦 Inventory</h2>
+  <div id="invDisabled" style="display:none" class="fsec">
+    <p>Inventory tracking is currently <b>disabled</b> for this hotel.</p>
+    <p style="color:var(--t2);font-size:14px">
+      Enable it from <b>⚙️ Hotel Settings → Inventory</b> (or ask your super-admin)
+      to track linen, toiletries, F&amp;B basics and kitchen supplies. WhatsApp
+      commands like <code>STOCK</code>, <code>ADD STOCK</code> and <code>LOW STOCK</code>
+      will activate at the same time.
+    </p>
+  </div>
+  <div id="invBody" style="display:none">
+    <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+      <button class="btn bg" onclick="invAdd()">➕ Add Item</button>
+      <button class="btn bgh" onclick="lInv()">🔄 Refresh</button>
+      <span id="invLowChip" style="display:none;align-self:center;color:var(--rd);font-weight:600"></span>
+    </div>
+    <div class="fsec" style="padding:0;overflow:auto">
+      <table class="tbl">
+        <thead><tr>
+          <th>Item</th><th>Category</th><th>Unit</th>
+          <th style="text-align:right">In stock</th>
+          <th style="text-align:right">Min</th>
+          <th style="text-align:right">Cost</th>
+          <th></th>
+        </tr></thead>
+        <tbody id="invTbody"><tr><td colspan="7" style="text-align:center;color:var(--t2);padding:20px">No items yet — click <b>Add Item</b> to begin.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 </main>
 
 <!-- Modal -->
@@ -410,6 +456,7 @@ async function lp(p){
   else if(p==='rev')lRev();else if(p==='sr')lSR();else if(p==='svc')lSvc();
   else if(p==='staff')lStaff();else if(p==='settings')lSet();
   else if(p==='reports')lReports();else if(p==='channel')lChannel();
+  else if(p==='inv')lInv();
 }
 function toast(m,t='ok'){const e=document.getElementById('toast');e.textContent=m;e.className='toast show t'+t;setTimeout(()=>e.className='toast',3000);}
 async function api(path,method='GET',body=null){
@@ -430,7 +477,7 @@ async function init(){
   document.getElementById('sbRole').textContent=(d.user_role||d.role||'').toUpperCase();
   document.getElementById('sbUser').textContent=d.name||'User';
   if(!d.can_view_revenue){document.getElementById('ni-rev').style.display='none';document.getElementById('ni-reports').style.display='none';}
-  if(!d.can_manage_services){document.getElementById('ni-svc').style.display='none';}
+  if(!d.can_manage_services){document.getElementById('ni-svc').style.display='none';document.getElementById('ni-inv').style.display='none';}
   if(!d.can_manage_staff){document.getElementById('ni-staff').style.display='none';}
   if(!d.can_edit_hotel){document.getElementById('ni-settings').style.display='none';document.getElementById('ni-channel').style.display='none';}
   if(!d.can_broadcast){document.getElementById('ni-bc').style.display='none';}
@@ -671,10 +718,15 @@ async function lSet(){
   for(const[id,key]of Object.entries(colors)){const el=document.getElementById(id);if(el)el.value=h[key]||'#000000';}
   if(document.getElementById('sCH'))document.getElementById('sCH').value=h.checkout_hour||11;
   if(document.getElementById('sLC'))document.getElementById('sLC').value=h.late_charge_flat||500;
+  // Inventory toggle — boolean → string for the <select>. Default false to
+  // mirror the hotels.inventory_enabled column default; the API simply
+  // omits the field for hotels added before the migration.
+  const ie = document.getElementById('sIE');
+  if (ie) ie.value = h.inventory_enabled ? 'true' : 'false';
 }
 
 async function saveSettings(){
-  const body={hotel_name:document.getElementById('sHN').value,tagline:document.getElementById('sTG').value,logo_url:document.getElementById('sLU').value,primary_color:document.getElementById('sPC').value,secondary_color:document.getElementById('sSC').value,background_color:document.getElementById('sBC').value,button_color:document.getElementById('sBTC').value,font_choice:document.getElementById('sFC').value,address:document.getElementById('sAD').value,city:document.getElementById('sCT').value,google_maps_url:document.getElementById('sGM').value,hotel_email:document.getElementById('sEM').value,hotel_whatsapp:document.getElementById('sHW').value,emergency_number:document.getElementById('sEN').value,wifi_name:document.getElementById('sWN').value,wifi_password:document.getElementById('sWP').value,check_in_time:document.getElementById('sCIT').value,checkout_time_display:document.getElementById('sCOT').value,google_review_url:document.getElementById('sGRU').value,welcome_message:document.getElementById('sWM').value,payment_mode:document.getElementById('sPM').value,razorpay_key_id:document.getElementById('sRK').value,upi_id:document.getElementById('sUI').value,upi_display_name:document.getElementById('sUD').value,checkout_hour:parseInt(document.getElementById('sCH').value)||11,late_charge_flat:parseFloat(document.getElementById('sLC').value)||500};
+  const body={hotel_name:document.getElementById('sHN').value,tagline:document.getElementById('sTG').value,logo_url:document.getElementById('sLU').value,primary_color:document.getElementById('sPC').value,secondary_color:document.getElementById('sSC').value,background_color:document.getElementById('sBC').value,button_color:document.getElementById('sBTC').value,font_choice:document.getElementById('sFC').value,address:document.getElementById('sAD').value,city:document.getElementById('sCT').value,google_maps_url:document.getElementById('sGM').value,hotel_email:document.getElementById('sEM').value,hotel_whatsapp:document.getElementById('sHW').value,emergency_number:document.getElementById('sEN').value,wifi_name:document.getElementById('sWN').value,wifi_password:document.getElementById('sWP').value,check_in_time:document.getElementById('sCIT').value,checkout_time_display:document.getElementById('sCOT').value,google_review_url:document.getElementById('sGRU').value,welcome_message:document.getElementById('sWM').value,payment_mode:document.getElementById('sPM').value,razorpay_key_id:document.getElementById('sRK').value,upi_id:document.getElementById('sUI').value,upi_display_name:document.getElementById('sUD').value,checkout_hour:parseInt(document.getElementById('sCH').value)||11,late_charge_flat:parseFloat(document.getElementById('sLC').value)||500,inventory_enabled:(document.getElementById('sIE')?document.getElementById('sIE').value==='true':false)};
   const r=await api('/api/hotel/'+slug+'/settings','PUT',body);
   if(r&&r.success){const s=document.getElementById('savedMsg');s.style.display='inline';toast('✅ Settings saved!');setTimeout(()=>s.style.display='none',3000);}else toast('Error saving','er');
 }
@@ -919,6 +971,108 @@ async function ingestBk(cbId){
 }
 
 init();
+
+// ── Inventory ───────────────────────────────────────────────────────────────
+async function lInv(){
+  const r = await api('/api/hotel/'+slug+'/inventory');
+  const body = document.getElementById('invBody');
+  const off  = document.getElementById('invDisabled');
+  // 403 from the gate when the module is disabled — show the explainer
+  // panel instead of an empty table, so an owner who hasn't enabled the
+  // feature gets a clear next-step.
+  if (!r){ off.style.display='block'; body.style.display='none'; return; }
+  if (r.detail && /disabled/i.test(r.detail)){ off.style.display='block'; body.style.display='none'; return; }
+  off.style.display='none'; body.style.display='block';
+
+  const items = r.items || [];
+  const low   = r.low_stock || [];
+  const chip  = document.getElementById('invLowChip');
+  if (low.length){ chip.style.display='inline'; chip.textContent='⚠️ '+low.length+' low-stock item(s)'; }
+  else { chip.style.display='none'; }
+
+  const tb = document.getElementById('invTbody');
+  if (!items.length){
+    tb.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--t2);padding:20px">No items yet — click <b>Add Item</b> to begin.</td></tr>';
+    return;
+  }
+  tb.innerHTML = items.map(it=>{
+    const lowFlag = parseFloat(it.current_stock||0) <= parseFloat(it.min_threshold||0);
+    return `<tr>
+      <td>${lowFlag?'🔴 ':''}${escHtml(it.item_name)}</td>
+      <td>${escHtml(it.category||'')}</td>
+      <td>${escHtml(it.unit||'')}</td>
+      <td style="text-align:right">${parseFloat(it.current_stock||0)}</td>
+      <td style="text-align:right">${parseFloat(it.min_threshold||0)}</td>
+      <td style="text-align:right">${it.cost_price?('₹'+parseFloat(it.cost_price)):''}</td>
+      <td>
+        <button class="btn bgh bsm" onclick='invEdit(${JSON.stringify(it)})'>✏️</button>
+        <button class="btn bgh bsm" onclick="invDel(${it.id},'${(it.item_name||'').replace(/'/g,"\\'")}')">🗑️</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function escHtml(s){ return String(s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function invAdd(){
+  document.getElementById('mT').textContent = 'Add Inventory Item';
+  document.getElementById('mC').innerHTML = invForm({});
+  document.getElementById('mSv').style.display = 'inline-flex';
+  svFn = ()=>invSave(null);
+  oM();
+}
+
+function invEdit(it){
+  document.getElementById('mT').textContent = 'Edit: '+(it.item_name||'');
+  document.getElementById('mC').innerHTML = invForm(it);
+  document.getElementById('mSv').style.display = 'inline-flex';
+  svFn = ()=>invSave(it.id);
+  oM();
+}
+
+function invForm(it){
+  return `
+    <div class="frow"><label>Item name</label>
+      <input id="iv_name" value="${escHtml(it.item_name||'')}" placeholder="e.g. Bath towel"/></div>
+    <div class="frow"><label>Category</label>
+      <input id="iv_cat" value="${escHtml(it.category||'General')}" placeholder="Linen / Toiletries / F&B / ..."/></div>
+    <div class="frow"><label>Unit</label>
+      <input id="iv_unit" value="${escHtml(it.unit||'pcs')}" placeholder="pcs / kg / ltr / box"/></div>
+    <div class="frow"><label>In stock</label>
+      <input id="iv_qty" type="number" step="0.01" value="${it.current_stock!=null?it.current_stock:0}"/></div>
+    <div class="frow"><label>Min threshold</label>
+      <input id="iv_min" type="number" step="0.01" value="${it.min_threshold!=null?it.min_threshold:0}"/></div>
+    <div class="frow"><label>Cost price (₹)</label>
+      <input id="iv_cost" type="number" step="0.01" value="${it.cost_price!=null?it.cost_price:0}"/></div>
+    <div class="frow"><label>Notes</label>
+      <textarea id="iv_notes" rows="2">${escHtml(it.notes||'')}</textarea></div>`;
+}
+
+async function invSave(id){
+  const body = {
+    item_name: document.getElementById('iv_name').value.trim(),
+    category:  document.getElementById('iv_cat').value.trim() || 'General',
+    unit:      document.getElementById('iv_unit').value.trim() || 'pcs',
+    current_stock: parseFloat(document.getElementById('iv_qty').value)||0,
+    min_threshold: parseFloat(document.getElementById('iv_min').value)||0,
+    cost_price:    parseFloat(document.getElementById('iv_cost').value)||0,
+    notes:     document.getElementById('iv_notes').value.trim(),
+  };
+  if (!body.item_name){ toast('Item name is required','er'); return; }
+  const url = id ? '/api/hotel/'+slug+'/inventory/'+id : '/api/hotel/'+slug+'/inventory';
+  const method = id ? 'PUT' : 'POST';
+  const r = await api(url, method, body);
+  if (r && r.success){ toast(id?'Updated':'Added'); cM(); lInv(); }
+  else if (r && r.detail){ toast(r.detail,'er'); }
+  else { toast('Save failed','er'); }
+}
+
+async function invDel(id, name){
+  if (!confirm('Delete '+name+'? This cannot be undone.')) return;
+  const r = await api('/api/hotel/'+slug+'/inventory/'+id, 'DELETE');
+  if (r && r.success){ toast('Deleted'); lInv(); }
+  else { toast('Delete failed','er'); }
+}
 </script>
 </body>
 </html>
