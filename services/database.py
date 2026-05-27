@@ -538,6 +538,21 @@ async def ensure_schema_v2():
         await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_by         VARCHAR(100) DEFAULT ''")
         await execute("ALTER TABLE rooms    ADD COLUMN IF NOT EXISTS last_cleaned_at         TIMESTAMP")
 
+        # 2a. Temporary closure (pause for a period of time). When `is_active=FALSE`
+        # is the result of a scheduled pause we also set `paused_until` so the
+        # auto-resume scheduler job knows when to flip `is_active` back on
+        # without operator action. `paused_at` and `paused_reason` are
+        # operator-facing metadata for the dashboard. All three NULL means
+        # the row is either fully active OR has been deactivated indefinitely
+        # (manual flip, no auto-resume planned).
+        await execute("ALTER TABLE hotels   ADD COLUMN IF NOT EXISTS paused_at      TIMESTAMP")
+        await execute("ALTER TABLE hotels   ADD COLUMN IF NOT EXISTS paused_until   TIMESTAMP")
+        await execute("ALTER TABLE hotels   ADD COLUMN IF NOT EXISTS paused_reason  VARCHAR(500) DEFAULT ''")
+        # Targeted partial index — most queries care about *which* hotel is
+        # paused right now, not historical rows; keep the index thin.
+        await execute("CREATE INDEX IF NOT EXISTS idx_hotels_paused_until "
+                      "ON hotels(paused_until) WHERE is_active=FALSE AND paused_until IS NOT NULL")
+
         # 2b. India compliance — GST place-of-supply (CGST/SGST vs IGST split)
         # `state_code` is the GSTIN 2-digit state code of the hotel itself; we
         # also persist legal_name + PAN for the printed tax invoice header.
@@ -951,8 +966,154 @@ async def update_hotel(hid: int, data: Dict) -> Optional[Dict]:
         if k in allowed:
             fields.append(f"{k}=${i}"); vals.append(v); i += 1
     if not fields: return await get_hotel_by_id(hid)
+    # If the caller is flipping `is_active` back to TRUE via a generic update
+    # (typically the legacy "Activate" toggle in the admin UI), also clear
+    # any leftover pause schedule so the dashboard badge doesn't keep
+    # showing "resumes 15 Jun" for a hotel that's already live again.
+    if data.get("is_active") is True:
+        fields.append("paused_at=NULL")
+        fields.append("paused_until=NULL")
+        fields.append("paused_reason=''")
     vals.append(hid)
     return await fetchrow(f"UPDATE hotels SET {','.join(fields)} WHERE id=${i} RETURNING *", *vals)
+
+
+# ══════════════════════════════════════════════════════════════════
+# HOTEL — Pause / Resume / Purge
+# Pause sets is_active=FALSE plus the paused_* metadata so a scheduler
+# job can auto-flip back on at `paused_until`. Purge is a HARD DELETE
+# that walks every known child table in a single transaction.
+# ══════════════════════════════════════════════════════════════════
+async def pause_hotel(hid: int, until: Optional[str], reason: str) -> Optional[Dict]:
+    """
+    Mark a hotel paused. `until` is an ISO-8601 timestamp (or date-only
+    YYYY-MM-DD treated as 23:59 IST). NULL `until` means an indefinite
+    pause that requires manual /resume. Returns the updated row.
+    """
+    from datetime import datetime, timedelta, timezone
+    until_dt = None
+    raw = (until or "").strip()
+    if raw:
+        if "T" in raw or " " in raw:
+            until_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if until_dt.tzinfo is not None:
+                until_dt = until_dt.astimezone(timezone.utc).replace(tzinfo=None)
+        else:
+            # Date-only → end-of-day IST → UTC naive for storage
+            ist_eod = datetime.fromisoformat(raw + "T23:59:59")
+            until_dt = ist_eod - timedelta(hours=5, minutes=30)
+        if until_dt <= datetime.utcnow():
+            raise ValueError("'until' must be in the future")
+
+    return await fetchrow(
+        """UPDATE hotels
+              SET is_active=FALSE,
+                  paused_at=NOW(),
+                  paused_until=$2,
+                  paused_reason=$3
+            WHERE id=$1
+        RETURNING *""",
+        hid, until_dt, (reason or "")[:500],
+    )
+
+
+async def resume_hotel(hid: int) -> Optional[Dict]:
+    """Clear pause metadata and flip is_active back on. Returns updated row."""
+    return await fetchrow(
+        """UPDATE hotels
+              SET is_active=TRUE,
+                  paused_at=NULL,
+                  paused_until=NULL,
+                  paused_reason=''
+            WHERE id=$1
+        RETURNING *""",
+        hid,
+    )
+
+
+async def get_due_paused_hotels(now=None) -> List[Dict]:
+    """Hotels whose scheduled pause has elapsed and need auto-resume."""
+    from datetime import datetime
+    return await fetch(
+        """SELECT id, hotel_name, slug, instance_name,
+                  paused_at, paused_until, paused_reason
+             FROM hotels
+            WHERE is_active=FALSE
+              AND paused_until IS NOT NULL
+              AND paused_until <= $1""",
+        now or datetime.utcnow(),
+    )
+
+
+# Tables that link back to a hotel by hotel_id. Order matters: leaf tables
+# first, then parents. We want to delete from each before removing the
+# hotels row so we don't trip a foreign key (the schema doesn't currently
+# declare ON DELETE CASCADE everywhere — list rebuilt from
+# _SEED_CHILD_TABLES + audit_log so a purge is exhaustive).
+_HOTEL_CHILD_TABLES_PURGE_ORDER = (
+    # request / log tables (no other deps)
+    "service_requests",
+    "stay_charges",
+    "payment_logs",
+    "additional_booking_guests",
+    "housekeeping_log",
+    "maintenance_tickets",
+    "hotel_food_orders",
+    "channel_inventory",
+    "channel_rate_plans",
+    "channel_room_types",
+    "channel_sync_log",
+    "channel_bookings",
+    "formc_filings",
+    "night_audits",
+    "audit_log",
+    # parents now safe to drop
+    "bookings",
+    "rooms",
+    "services",
+    "staff_departments",
+    "hotel_users",
+    "hotel_food_items",
+    "channel_accounts",
+)
+
+
+async def purge_hotel(hid: int) -> Dict[str, int]:
+    """
+    HARD DELETE a hotel and every child row that references it. Runs in a
+    single transaction so a partial failure leaves the DB consistent.
+    Returns a per-table row-count dict for the audit payload.
+
+    The hotels row itself is deleted last. If any child table doesn't
+    exist on this older deploy we silently skip it — same defensive
+    pattern as `purge_pristine_seed_hotel`.
+    """
+    counts: Dict[str, int] = {}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            for tbl in _HOTEL_CHILD_TABLES_PURGE_ORDER:
+                try:
+                    res = await conn.execute(
+                        f"DELETE FROM {tbl} WHERE hotel_id=$1", hid
+                    )
+                    # asyncpg returns "DELETE n"
+                    try:
+                        counts[tbl] = int(res.split()[-1])
+                    except Exception:
+                        counts[tbl] = 0
+                except asyncpg.UndefinedTableError:
+                    counts[tbl] = 0
+                except Exception as e:
+                    logger.warning("purge_hotel: %s delete failed: %s", tbl, e)
+                    counts[tbl] = -1
+            res = await conn.execute("DELETE FROM hotels WHERE id=$1", hid)
+            try:
+                counts["hotels"] = int(res.split()[-1])
+            except Exception:
+                counts["hotels"] = 0
+    return counts
+
 
 # ══════════════════════════════════════════════════════════════════
 # HOTEL USERS — Owners / Managers / Staff

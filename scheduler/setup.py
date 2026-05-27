@@ -3,7 +3,8 @@ from apscheduler.triggers.cron import CronTrigger
 from scheduler.jobs import (job_daily_report, job_monthly_report,
     job_reminder_1, job_reminder_2, job_late_alert,
     job_auto_late_charge, job_auto_cleanup, job_night_audit,
-    job_channel_push_inventory, job_channel_pull_bookings)
+    job_channel_push_inventory, job_channel_pull_bookings,
+    job_resume_paused_hotels)
 from services.database import get_all_hotels
 import logging
 
@@ -15,6 +16,13 @@ async def start_scheduler():
     # Cleanup every 30 min — always
     scheduler.add_job(job_auto_cleanup, CronTrigger(minute="*/30", timezone="Asia/Kolkata"),
                       id="auto_cleanup", replace_existing=True)
+
+    # Auto-resume any hotel whose paused_until has elapsed. Cheap query on
+    # an indexed column; safe at 5-min cadence so an owner who scheduled
+    # a pause until 18:00 doesn't have to flip it back manually.
+    scheduler.add_job(job_resume_paused_hotels,
+                      CronTrigger(minute="*/5", timezone="Asia/Kolkata"),
+                      id="resume_paused_hotels", replace_existing=True)
 
     # Channel manager (OTA aggregator) — global jobs that walk every
     # hotel with an active channel account. We keep two cadences:

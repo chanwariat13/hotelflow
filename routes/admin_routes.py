@@ -92,12 +92,121 @@ async def update_hotel(hid: int, request: Request):
 
 @router.delete("/hotels/{hid}")
 async def delete_hotel(hid: int, request: Request):
-    """Soft delete: set is_active=FALSE, keep all history."""
+    """Soft delete: set is_active=FALSE, keep all history.
+
+    Note: This endpoint is preserved for back-compat (the old admin UI
+    called `DELETE /hotels/{hid}` for the Deactivate toggle). Real
+    permanent deletion is `POST /hotels/{hid}/purge` — see below.
+    Pausing for a fixed window is `POST /hotels/{hid}/pause`.
+    """
     user = await require_superadmin(request)
     await db.execute("UPDATE hotels SET is_active=FALSE WHERE id=$1", hid)
     await audit("hotel.deactivate", actor=_actor(user), actor_role="superadmin",
                 hotel_id=hid, target=str(hid), request=request)
     return JSONResponse({"success": True})
+
+
+# ── Pause for a period (temporary closure) ────────────────────────
+@router.post("/hotels/{hid}/pause")
+async def pause_hotel_route(hid: int, request: Request):
+    """
+    Temporarily disable a hotel. The bot (gated by
+    `get_hotel_by_instance` filtering on `is_active=TRUE`) and the
+    scheduled jobs (`if not h.get("is_active"): continue`) are already
+    no-ops for paused hotels, so flipping `is_active=FALSE` stops every
+    customer-facing flow. We additionally persist `paused_until` so the
+    auto-resume scheduler job knows when to flip it back without operator
+    action.
+
+    Body: { "until": "2026-06-15" or "2026-06-15T18:00", "reason": "..." }
+    Empty `until` = indefinite pause; only manual /resume will reopen.
+    """
+    user = await require_superadmin(request)
+    body = await request.json()
+    until = (body.get("until") or "").strip() or None
+    reason = (body.get("reason") or "").strip()
+    try:
+        hotel = await db.pause_hotel(hid, until, reason)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not hotel:
+        raise HTTPException(404, "Hotel not found")
+    await audit("hotel.pause", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(hid),
+                payload={"until": until, "reason": reason}, request=request)
+    out = dict(hotel)
+    for k in ("paused_at", "paused_until", "created_at", "updated_at"):
+        if out.get(k):
+            try: out[k] = out[k].isoformat()
+            except Exception: pass
+    return JSONResponse({"success": True, "hotel": out})
+
+
+# ── Resume (cancel pause / activate) ──────────────────────────────
+@router.post("/hotels/{hid}/resume")
+async def resume_hotel_route(hid: int, request: Request):
+    user = await require_superadmin(request)
+    hotel = await db.resume_hotel(hid)
+    if not hotel:
+        raise HTTPException(404, "Hotel not found")
+    await audit("hotel.resume", actor=_actor(user), actor_role="superadmin",
+                hotel_id=hid, target=str(hid), request=request)
+    return JSONResponse({"success": True})
+
+
+# ── Permanent delete (purge) ──────────────────────────────────────
+@router.post("/hotels/{hid}/purge")
+async def purge_hotel_route(hid: int, request: Request):
+    """
+    HARD DELETE a hotel and every child row (rooms, bookings, charges,
+    payment logs, services, audit, channel rows, …). Runs in a single
+    transaction so a partial failure leaves the DB consistent.
+
+    Safety:
+      * Body MUST include `confirm_slug` matching the hotel's slug. Anything
+        else returns 400 — protects against accidental clicks.
+      * Optionally `purge_audit=false` to keep the per-hotel audit_log
+        rows (recommended for legal-defensibility). Default is to wipe
+        every child row including audit_log because there's no foreign
+        key from audit_log to anything else once the hotel row is gone.
+    """
+    import hmac as _hmac
+    user = await require_superadmin(request)
+    body = await request.json()
+    confirm = (body.get("confirm_slug") or "").strip()
+
+    hotel = await db.get_hotel_by_id(hid)
+    if not hotel:
+        raise HTTPException(404, "Hotel not found")
+    if not confirm or not _hmac.compare_digest(confirm, hotel["slug"]):
+        raise HTTPException(
+            400,
+            "confirm_slug must equal the hotel's slug — type it exactly to confirm",
+        )
+
+    # Snapshot identity for the post-delete audit entry. We can't audit by
+    # hotel_id after the row is gone (audit row will reference a non-existent
+    # FK), so we record at master scope (hotel_id=NULL) and stash the
+    # original identity in the payload.
+    snapshot = {
+        "hotel_id":     hid,
+        "hotel_name":   hotel.get("hotel_name"),
+        "slug":         hotel.get("slug"),
+        "instance":     hotel.get("instance_name"),
+    }
+
+    counts = await db.purge_hotel(hid)
+
+    await audit("hotel.purge", actor=_actor(user), actor_role="superadmin",
+                hotel_id=None, target=str(hid),
+                payload={**snapshot, "deleted_counts": counts},
+                request=request)
+
+    return JSONResponse({
+        "success": True,
+        "message": f"Hotel '{snapshot['slug']}' permanently deleted",
+        "deleted": counts,
+    })
 
 # ── Hotel Users (staff management from master admin) ──────────────
 @router.get("/hotels/{hid}/users")

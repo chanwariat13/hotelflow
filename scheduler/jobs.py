@@ -239,3 +239,40 @@ async def job_channel_pull_bookings():
             logger.info("channel.pull_bookings ran: %s", results)
     except Exception as e:
         logger.error(f"channel pull_bookings error: {e}")
+
+
+
+# ── Auto-resume paused hotels ────────────────────────────────────
+# Runs on a tight cadence (every few minutes) so an owner who scheduled
+# a pause until 6 PM doesn't have to babysit the system to resume on
+# time. Cheap query — partial index on hotels(paused_until) WHERE
+# is_active=FALSE AND paused_until IS NOT NULL.
+async def job_resume_paused_hotels():
+    try:
+        due = await db.get_due_paused_hotels()
+        for h in due:
+            hid = h["id"]
+            old_until = h.get("paused_until")
+            old_reason = (h.get("paused_reason") or "").strip()
+            row = await db.resume_hotel(hid)
+            if not row:
+                continue
+            try:
+                # Best-effort owner ping; never block the loop on a WhatsApp
+                # outage or a hotel without configured staff phones.
+                phones = await db.get_staff_phones(hid, ["owner", "manager"])
+                if phones:
+                    msg = (
+                        f"✅ *Service auto-resumed*\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"🏨 {h.get('hotel_name','')}\n"
+                        f"⏰ Pause ended at: {old_until.isoformat() if old_until else '—'} UTC\n"
+                        + (f"📝 Reason: {old_reason}\n" if old_reason else "")
+                        + f"\nGuest pages, registration, and the WhatsApp bot are live again.\n_Auto · HotelFlow_"
+                    )
+                    await send_to_phones(h["instance_name"], phones, msg)
+            except Exception as e:
+                logger.warning("resume notify failed for hotel_id=%s: %s", hid, e)
+            logger.info("auto-resumed hotel_id=%s slug=%s", hid, h.get("slug"))
+    except Exception as e:
+        logger.error(f"job_resume_paused_hotels error: {e}")
