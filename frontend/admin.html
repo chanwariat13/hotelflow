@@ -322,30 +322,91 @@ async function lHotels(){
   allHotels=d?.hotels||[];
   const list=document.getElementById('hotelList');
   if(!allHotels.length){list.innerHTML='<p style="color:var(--t2)">No hotels. <a href="#" onclick="nav(\'add\')" style="color:var(--gd)">Add one →</a></p>';return;}
-  list.innerHTML=allHotels.map(h=>`
-    <div class="hotel-card">
+  list.innerHTML=allHotels.map(h=>{
+    // Show "resumes 15 Jun 18:00" tail under the badge so the operator can
+    // see at a glance when service comes back without opening Manage.
+    let pausedNote='';
+    if(!h.is_active && h.paused_until){
+      const d=new Date(h.paused_until);
+      pausedNote=`<span style="font-size:11px;color:var(--t2);margin-left:4px">resumes ${d.toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit'})}</span>`;
+    }else if(!h.is_active && h.paused_reason){
+      pausedNote=`<span style="font-size:11px;color:var(--t2);margin-left:4px" title="${(h.paused_reason||'').replace(/"/g,'&quot;')}">${(h.paused_reason||'').slice(0,28)}</span>`;
+    }
+    return `<div class="hotel-card">
       <div>
         <div style="font-weight:600;font-size:15px;margin-bottom:3px">${h.hotel_name}</div>
         <div style="font-size:12px;color:var(--t2);font-family:monospace">/hotel/${h.slug} · ${h.instance_name}</div>
-        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
-          <span class="bdg b${h.is_active?'a':'bo'}">${h.is_active?'Active':'Inactive'}</span>
+        <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          <span class="bdg b${h.is_active?'a':'bo'}">${h.is_active?'Active':'Paused'}</span>
+          ${pausedNote}
           <span class="tag">${h.payment_mode||'razorpay'}</span>
         </div>
       </div>
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="btn bg bsm" onclick="manageH(${h.id},'${h.slug}')">Manage</button>
         <button class="btn bgh bsm" onclick="window.open('/hotel/${h.slug}','_blank')">Dashboard →</button>
-        <button class="btn brd bsm" onclick="togH(${h.id},${h.is_active})">${h.is_active?'Deactivate':'Activate'}</button>
+        ${h.is_active
+          ? `<button class="btn brd bsm" onclick="pauseH(${h.id},'${(h.hotel_name||'').replace(/'/g,"\\'")}')">⏸ Pause…</button>`
+          : `<button class="btn brd bsm" onclick="resumeH(${h.id})">▶ Resume</button>`}
+        <button class="btn brd bsm" style="border-color:#e74c3c;color:#e74c3c" onclick="purgeH(${h.id},'${h.slug}','${(h.hotel_name||'').replace(/'/g,"\\'")}')">🗑 Delete</button>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   // Populate hotel filter in bookings
   const sel=document.getElementById('bkHotel');
   sel.innerHTML='<option value="">All Hotels</option>'+allHotels.map(h=>'<option value="'+h.id+'">'+h.hotel_name+'</option>').join('');
 }
 
+// ─── Pause / Resume / Permanent delete ──────────────────────────────
+async function pauseH(id,name){
+  // Two-step prompt: how long, then optional reason. Empty "until" =
+  // indefinite pause (operator must manually resume via /resume).
+  const until=prompt(
+    `Pause "${name}" until when?\n\n`+
+    `• Date e.g.  2026-06-15\n`+
+    `• Or date+time e.g.  2026-06-15T18:00\n`+
+    `• Leave EMPTY for indefinite pause (manual resume only)\n\n`+
+    `Tip: pausing immediately blocks the guest registration page, in-room ordering, the WhatsApp bot, and scheduled reports for this hotel. Existing bookings stay intact.`
+  );
+  if(until===null) return; // cancelled
+  const reason=prompt(`Reason for pause (optional):`,'')||'';
+  const r=await api('/api/admin/hotels/'+id+'/pause','POST',{until:(until||'').trim(),reason});
+  if(r&&r.success){toast('Hotel paused');lHotels();lDash();}
+  else if(r&&r.detail) toast(r.detail,'er');
+}
+
+async function resumeH(id){
+  if(!confirm('Resume this hotel now? Guests will be able to register and order immediately.'))return;
+  const r=await api('/api/admin/hotels/'+id+'/resume','POST',{});
+  if(r&&r.success){toast('Hotel resumed');lHotels();lDash();}
+}
+
+async function purgeH(id,slug,name){
+  // Three-step guard: warn → type-the-slug → final OK.
+  if(!confirm(
+        `⚠️ PERMANENTLY DELETE "${name}"?\n\n`+
+        `This wipes the hotel and EVERY linked row:\n`+
+        `• rooms, bookings, charges, payment logs\n`+
+        `• services, staff users, food items + orders\n`+
+        `• housekeeping, maintenance, channel rows, audit log\n\n`+
+        `There is NO undo. Soft-deactivation (Pause) is preserved if you want history kept.\n\nContinue?`)) return;
+  const typed=prompt(
+        `To confirm, type the slug exactly:\n\n  ${slug}\n\n`+
+        `(case-sensitive — this is the safety net against accidents)`);
+  if(typed===null) return;
+  if(typed!==slug){toast('Slug did not match — cancelled.','er');return;}
+  const r=await api('/api/admin/hotels/'+id+'/purge','POST',{confirm_slug:slug});
+  if(r&&r.success){toast(`"${slug}" deleted`);lHotels();lDash();}
+}
+
 async function togH(id,cur){
-  await api('/api/admin/hotels/'+id,'PUT',{is_active:!cur});
-  toast(cur?'Hotel deactivated':'Hotel activated');lHotels();
+  // Kept for back-compat with the dashboard snapshot card. New callers
+  // should use pauseH / resumeH / purgeH directly.
+  if(cur){
+    const h=allHotels.find(x=>x.id===id);
+    return pauseH(id,h?.hotel_name||'');
+  }
+  return resumeH(id);
 }
 
 async function manageH(id,slug){

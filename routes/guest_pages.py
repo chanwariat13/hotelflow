@@ -17,6 +17,39 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
+async def _active_hotel_or_block(slug: str) -> dict:
+    """Resolve a hotel by slug for guest-facing pages.
+
+    * 404 if the slug is unknown.
+    * 503 + a friendly message if the hotel is paused / deactivated. The
+      message includes the auto-resume time when one is scheduled, so a
+      guest who scans the QR while the place is on a fixed pause sees
+      *when* it'll reopen rather than a generic "not found" wall.
+
+    Admin / staff routes deliberately keep using `db.get_hotel_by_slug`
+    directly so operators can still manage a paused hotel.
+    """
+    hotel = await db.get_hotel_by_slug(slug)
+    if not hotel:
+        raise HTTPException(404, "Hotel not found")
+    if not hotel.get("is_active"):
+        until = hotel.get("paused_until")
+        reason = (hotel.get("paused_reason") or "").strip()
+        msg = f"{hotel.get('hotel_name','This hotel')} is temporarily unavailable."
+        if until:
+            try:
+                # Stored as naive UTC; convert back to IST for the guest.
+                from datetime import timedelta
+                ist = until + timedelta(hours=5, minutes=30)
+                msg += f" Reopens around {ist.strftime('%d %b %Y, %H:%M IST')}."
+            except Exception:
+                pass
+        if reason:
+            msg += f" ({reason})"
+        raise HTTPException(503, msg)
+    return hotel
+
+
 def _client_ip(request: Request) -> str:
     """Best-effort client IP for rate-limit bucketing.
 
@@ -135,8 +168,7 @@ function showToast(m,ok=true){{const t=document.getElementById('toast');t.textCo
 # ── REGISTRATION PAGE ─────────────────────────────────────────────
 @router.get("/register/{slug}", response_class=HTMLResponse)
 async def reg_page(slug: str, request: Request):
-    hotel = await db.get_hotel_by_slug(slug)
-    if not hotel: raise HTTPException(404,"Hotel not found")
+    hotel = await _active_hotel_or_block(slug)
     hid = hotel["id"]
     rooms = await db.get_all_rooms(hid)
     room_opts = ""
@@ -320,8 +352,7 @@ document.getElementById('gPhone').addEventListener('input', function(){{
 # ── MENU / SERVICE PAGE ───────────────────────────────────────────
 @router.get("/menu/{slug}", response_class=HTMLResponse)
 async def menu_page(slug: str, request: Request):
-    hotel = await db.get_hotel_by_slug(slug)
-    if not hotel: raise HTTPException(404)
+    hotel = await _active_hotel_or_block(slug)
     hid = hotel["id"]
     services = await db.get_services(hid)
     pri = safe_color(hotel.get("primary_color"), "#c8a84b")
@@ -424,8 +455,7 @@ if(p.get('p')){{document.getElementById('phoneInp').value=p.get('p');if(p.get('r
 # ── BILL PAGE ─────────────────────────────────────────────────────
 @router.get("/bill/{slug}", response_class=HTMLResponse)
 async def bill_page(slug: str, request: Request):
-    hotel = await db.get_hotel_by_slug(slug)
-    if not hotel: raise HTTPException(404)
+    hotel = await _active_hotel_or_block(slug)
     pri = safe_color(hotel.get("primary_color"), "#c8a84b")
     body = f"""
 <div class="card"><div class="ct">💰 View Your Bill</div>
@@ -490,6 +520,20 @@ async def api_register(request: Request):
     slug = body.get("slug","")
     hotel = await db.get_hotel_by_slug(slug)
     if not hotel: return JSONResponse({"success":False,"error":"Hotel not found"},404)
+    if not hotel.get("is_active"):
+        # Don't even let a guest who already loaded the form (perhaps before
+        # the pause kicked in) submit a new booking. We reuse the friendly
+        # 503 message format the page-route helper produces.
+        until = hotel.get("paused_until")
+        msg = f"{hotel.get('hotel_name','This hotel')} is temporarily not accepting new bookings."
+        if until:
+            try:
+                from datetime import timedelta
+                ist = until + timedelta(hours=5, minutes=30)
+                msg += f" Reopens around {ist.strftime('%d %b %Y, %H:%M IST')}."
+            except Exception:
+                pass
+        return JSONResponse({"success": False, "error": msg}, 503)
     hid = hotel["id"]
     room  = str(body.get("room","")).strip().upper()
     secret= str(body.get("secret","")).strip()
