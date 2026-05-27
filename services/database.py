@@ -663,6 +663,46 @@ async def ensure_schema_v2():
         await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_booking ON hotel_food_orders(booking_id)")
         await execute("CREATE INDEX IF NOT EXISTS idx_food_orders_room    ON hotel_food_orders(room_number, status)")
 
+        # 3.5 Inventory module (opt-in per hotel).
+        # `hotels.inventory_enabled` is the master toggle the owner / super
+        # admin flips from the dashboard. When FALSE the dashboard tab,
+        # REST endpoints and bot commands are all no-ops for that hotel —
+        # so the module stays out of the way for properties that don't care
+        # about supply tracking. Default FALSE because most existing hotels
+        # haven't asked for it; flipping a single boolean later is cheap.
+        await execute(
+            "ALTER TABLE hotels ADD COLUMN IF NOT EXISTS inventory_enabled BOOLEAN DEFAULT FALSE"
+        )
+        # `hotel_inventory_items` is one row per SKU per hotel. Quantity-on-hand
+        # lives on the row itself rather than in a transactions log because the
+        # use case (linen / toiletries / F&B basics) doesn't need
+        # transaction-level history — owners just want a quick "how much do
+        # we have?" view and a low-stock alert. Item names are
+        # case-insensitively unique per hotel via a functional index so the
+        # bot's `ADD STOCK Tomato: 5 kg` and `ADD STOCK tomato: 7 kg` target
+        # the same row.
+        await execute("""
+            CREATE TABLE IF NOT EXISTS hotel_inventory_items (
+                id            SERIAL PRIMARY KEY,
+                hotel_id      INTEGER       NOT NULL,
+                item_name     VARCHAR(150)  NOT NULL,
+                category      VARCHAR(60)   DEFAULT 'General',
+                unit          VARCHAR(20)   DEFAULT 'pcs',
+                current_stock NUMERIC(12,2) DEFAULT 0,
+                min_threshold NUMERIC(12,2) DEFAULT 0,
+                cost_price    NUMERIC(10,2) DEFAULT 0,
+                notes         TEXT          DEFAULT '',
+                created_at    TIMESTAMP     DEFAULT NOW(),
+                updated_at    TIMESTAMP     DEFAULT NOW()
+            )
+        """)
+        await execute("CREATE INDEX IF NOT EXISTS idx_hinv_hotel       ON hotel_inventory_items(hotel_id)")
+        await execute("CREATE INDEX IF NOT EXISTS idx_hinv_low         ON hotel_inventory_items(hotel_id) WHERE current_stock <= min_threshold")
+        await execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_hinv_hotel_name "
+            "ON hotel_inventory_items(hotel_id, LOWER(item_name))"
+        )
+
         # 4. Night audit + KPI reports.
         # Bigger hotels (3-star and above) cannot evaluate the property
         # without ADR / RevPAR / occupancy. The night audit also closes
@@ -962,6 +1002,7 @@ async def update_hotel(hid: int, data: Dict) -> Optional[Dict]:
         "sched_reminder2_min","sched_late_alert_hour","sched_late_alert_min",
         "sched_auto_charge_hour","sched_auto_charge_min",
         "sched_night_audit_hour","sched_night_audit_min","auto_post_room_rent",
+        "inventory_enabled",
         "is_active"
     ]
     fields, vals, i = [], [], 1
@@ -1062,6 +1103,7 @@ _HOTEL_CHILD_TABLES_PURGE_ORDER = (
     "housekeeping_log",
     "maintenance_tickets",
     "hotel_food_orders",
+    "hotel_inventory_items",
     "channel_inventory",
     "channel_rate_plans",
     "channel_room_types",
@@ -2635,4 +2677,155 @@ async def aggregate_inventory_for_dates(hotel_id: int, dates: List) -> List[Dict
         ORDER BY d.d, t.provider_code
         """,
         hotel_id, dates,
+    )
+
+
+
+# ══════════════════════════════════════════════════════════════════
+# INVENTORY (per-hotel supply tracking — opt-in via hotels.inventory_enabled)
+# Schema lives in `hotel_inventory_items` (created by ensure_schema_v2).
+# Every helper here scopes by hotel_id so a leaked item id from one
+# tenant can't be used to read or mutate another tenant's row.
+# ══════════════════════════════════════════════════════════════════
+async def list_inventory_items(hotel_id: int) -> List[Dict]:
+    """All inventory rows for one hotel, alphabetised. Cheap query — the
+    `idx_hinv_hotel` partial index covers it."""
+    return await fetch(
+        """SELECT id, hotel_id, item_name, category, unit,
+                  current_stock, min_threshold, cost_price, notes,
+                  created_at, updated_at
+             FROM hotel_inventory_items
+            WHERE hotel_id=$1
+            ORDER BY LOWER(item_name)""",
+        hotel_id,
+    )
+
+
+async def get_inventory_item(item_id: int, hotel_id: int) -> Optional[Dict]:
+    """Single row, scoped by hotel so a cross-tenant id can't read it."""
+    return await fetchrow(
+        "SELECT * FROM hotel_inventory_items WHERE id=$1 AND hotel_id=$2",
+        item_id, hotel_id,
+    )
+
+
+async def create_inventory_item(hotel_id: int, data: Dict) -> Dict:
+    """Insert a brand-new SKU. The (hotel_id, LOWER(item_name)) unique
+    index will refuse duplicates — callers should catch UniqueViolationError
+    or call `upsert_inventory_by_name` instead.
+    """
+    name = (data.get("item_name") or "").strip()
+    if not name:
+        raise ValueError("item_name is required")
+    return await fetchrow(
+        """INSERT INTO hotel_inventory_items
+              (hotel_id,item_name,category,unit,current_stock,min_threshold,cost_price,notes)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING *""",
+        hotel_id, name,
+        (data.get("category") or "General")[:60],
+        (data.get("unit") or "pcs")[:20],
+        float(data.get("current_stock") or 0),
+        float(data.get("min_threshold") or 0),
+        float(data.get("cost_price") or 0),
+        (data.get("notes") or "")[:1000],
+    )
+
+
+async def update_inventory_item(item_id: int, hotel_id: int, data: Dict) -> Optional[Dict]:
+    """Patch a subset of fields on an existing row. Unknown keys are
+    silently ignored so a future column can be added without breaking
+    older clients. Returns NULL if no row matched (cross-tenant id, or
+    deleted between request and update)."""
+    allowed = {
+        "item_name", "category", "unit",
+        "current_stock", "min_threshold", "cost_price", "notes",
+    }
+    fields, vals, i = [], [], 1
+    for k, v in (data or {}).items():
+        if k not in allowed:
+            continue
+        fields.append(f"{k}=${i}")
+        if k in ("current_stock", "min_threshold", "cost_price"):
+            vals.append(float(v or 0))
+        else:
+            vals.append((v or "") if isinstance(v, str) else v)
+        i += 1
+    if not fields:
+        return await get_inventory_item(item_id, hotel_id)
+    fields.append("updated_at=NOW()")
+    vals.extend([item_id, hotel_id])
+    return await fetchrow(
+        f"UPDATE hotel_inventory_items SET {','.join(fields)} "
+        f"WHERE id=${i} AND hotel_id=${i+1} RETURNING *",
+        *vals,
+    )
+
+
+async def delete_inventory_item(item_id: int, hotel_id: int) -> bool:
+    """Hard-delete a row scoped to the caller's hotel. Returns True if a
+    row was actually removed."""
+    res = await execute(
+        "DELETE FROM hotel_inventory_items WHERE id=$1 AND hotel_id=$2",
+        item_id, hotel_id,
+    )
+    try:
+        return int(str(res).split()[-1]) > 0
+    except Exception:
+        return False
+
+
+async def upsert_inventory_by_name(
+    hotel_id: int, name: str, qty: float, unit: str = "pcs",
+    min_threshold: Optional[float] = None,
+) -> Dict:
+    """Used by the WhatsApp `ADD STOCK` command. Case-insensitive lookup
+    via the unique functional index; UPDATE-or-INSERT in one round-trip
+    so two near-simultaneous bot messages don't race into duplicate rows.
+    `min_threshold=None` means "leave it unchanged on update", so an
+    owner can bump the count without resetting their alert level.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("name is required")
+    existing = await fetchrow(
+        "SELECT id FROM hotel_inventory_items "
+        "WHERE hotel_id=$1 AND LOWER(item_name)=LOWER($2)",
+        hotel_id, name,
+    )
+    if existing:
+        if min_threshold is not None:
+            return await fetchrow(
+                "UPDATE hotel_inventory_items "
+                "SET current_stock=$1, unit=$2, min_threshold=$3, updated_at=NOW() "
+                "WHERE id=$4 RETURNING *",
+                float(qty), unit[:20], float(min_threshold), existing["id"],
+            )
+        return await fetchrow(
+            "UPDATE hotel_inventory_items "
+            "SET current_stock=$1, unit=$2, updated_at=NOW() "
+            "WHERE id=$3 RETURNING *",
+            float(qty), unit[:20], existing["id"],
+        )
+    return await fetchrow(
+        """INSERT INTO hotel_inventory_items
+              (hotel_id,item_name,unit,current_stock,min_threshold)
+           VALUES ($1,$2,$3,$4,$5)
+        RETURNING *""",
+        hotel_id, name, unit[:20], float(qty),
+        float(min_threshold or 0),
+    )
+
+
+async def get_low_stock_inventory(hotel_id: int) -> List[Dict]:
+    """Rows where current_stock has dropped to or below the configured
+    threshold. Used by the bot's `LOW STOCK` command and any future
+    daily-report job."""
+    return await fetch(
+        """SELECT id, item_name, current_stock, min_threshold, unit
+             FROM hotel_inventory_items
+            WHERE hotel_id=$1
+              AND current_stock <= min_threshold
+            ORDER BY (current_stock - min_threshold) ASC, LOWER(item_name)""",
+        hotel_id,
     )

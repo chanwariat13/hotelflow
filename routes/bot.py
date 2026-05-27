@@ -244,6 +244,128 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     m = re.match(r"^UNBLOCK\s+(\d+)$", UP)
     if m: await unblock_user(m.group(1), hid); await send_text(instance, phone, f"✅ {m.group(1)} unblocked."); return
 
+    # ── Inventory module (gated by hotels.inventory_enabled) ────────
+    # Owners / managers asked for a no-dashboard way to add and check
+    # supplies from WhatsApp itself. The full surface is:
+    #   STOCK                              — list everything (with low-stock flag)
+    #   LOW STOCK                          — only items at or below threshold
+    #   ADD STOCK <name>: <qty> [<unit>] [min <m>]    — upsert a row
+    #   UPDATE STOCK <name> <qty>          — set current_stock for an existing row
+    # The flag check happens HERE rather than in handle_message so a
+    # disabled hotel still gets a clean "module disabled" reply (instead
+    # of an "unknown command" reply that would be misleading).
+    inv_enabled = bool(hotel.get("inventory_enabled"))
+
+    if UP in ("STOCK", "LIST STOCK", "SHOW STOCK"):
+        if not inv_enabled:
+            await send_text(instance, phone,
+                "ℹ️ Inventory module is disabled for this hotel. "
+                "Enable it from the dashboard to use stock commands."); return
+        rows = await db.list_inventory_items(hid)
+        if not rows:
+            await send_text(instance, phone,
+                "📦 *Inventory is empty.*\n"
+                "Add an item with:\n*ADD STOCK Pillows: 20 pcs min 5*"); return
+        msg = "📦 *CURRENT STOCK*\n━━━━━━━━━━━━━━━━━━\n"
+        for r in rows:
+            cs = float(r.get("current_stock") or 0)
+            mt = float(r.get("min_threshold") or 0)
+            unit = r.get("unit") or ""
+            e = "🔴" if cs <= mt else "🟢"
+            msg += f"\n{e} *{r['item_name']}*: {cs:g}{unit} (min: {mt:g}{unit})"
+        await send_text(instance, phone, msg)
+        return
+
+    if UP in ("LOW STOCK", "LOWSTOCK"):
+        if not inv_enabled:
+            await send_text(instance, phone,
+                "ℹ️ Inventory module is disabled for this hotel."); return
+        rows = await db.get_low_stock_inventory(hid)
+        if not rows:
+            await send_text(instance, phone, "✅ No low-stock items. Everything is above its minimum."); return
+        msg = "🔴 *LOW STOCK ALERT*\n━━━━━━━━━━━━━━━━━━\n"
+        for r in rows:
+            cs = float(r.get("current_stock") or 0)
+            mt = float(r.get("min_threshold") or 0)
+            unit = r.get("unit") or ""
+            msg += f"\n• *{r['item_name']}*: {cs:g}{unit} (min {mt:g}{unit})"
+        msg += "\n\nReplenish via dashboard or:\n*UPDATE STOCK <name> <qty>*"
+        await send_text(instance, phone, msg)
+        return
+
+    # ADD STOCK <name>: <qty> [<unit>] [min <m>] — multi-word names allowed
+    # before the colon. We match on the original text (not UP-cased) so
+    # the saved item_name preserves its display casing; the lookup is
+    # case-insensitive at the DB layer.
+    m = re.match(
+        r"^ADD\s+STOCK\s+(.+?)\s*:\s*([\d.]+)\s*([A-Za-z]*)\s*(?:[Mm][Ii][Nn]\s+([\d.]+))?$",
+        text,
+    )
+    if m:
+        if not inv_enabled:
+            await send_text(instance, phone,
+                "ℹ️ Inventory module is disabled for this hotel."); return
+        if not su.get("can_manage_services"):
+            await send_text(instance, phone,
+                "⛔ You don't have permission to manage inventory."); return
+        name = (m.group(1) or "").strip()
+        try:
+            qty = float(m.group(2))
+        except Exception:
+            await send_text(instance, phone,
+                "⚠️ Invalid quantity. Try: ADD STOCK Pillows: 20 pcs min 5"); return
+        unit = (m.group(3) or "").strip() or "pcs"
+        min_q = None
+        if m.group(4):
+            try: min_q = float(m.group(4))
+            except: min_q = None
+        try:
+            row = await db.upsert_inventory_by_name(hid, name, qty, unit, min_q)
+        except Exception as e:
+            await send_text(instance, phone, f"⚠️ Could not save: {e}"); return
+        cs = float(row.get("current_stock") or 0)
+        mt = float(row.get("min_threshold") or 0)
+        u  = row.get("unit") or unit
+        await send_text(instance, phone,
+            f"✅ Saved: *{row['item_name']}* — {cs:g}{u} (min {mt:g}{u})")
+        return
+
+    # UPDATE STOCK <name> <qty> — name is everything between the verb and
+    # the trailing number; trailing unit is optional and ignored (we keep
+    # the row's existing unit).
+    m = re.match(
+        r"^UPDATE\s+STOCK\s+(.+?)\s+([\d.]+)\s*[A-Za-z]*$",
+        text,
+    )
+    if m:
+        if not inv_enabled:
+            await send_text(instance, phone,
+                "ℹ️ Inventory module is disabled for this hotel."); return
+        if not su.get("can_manage_services"):
+            await send_text(instance, phone,
+                "⛔ You don't have permission to manage inventory."); return
+        name = (m.group(1) or "").strip()
+        try:
+            qty = float(m.group(2))
+        except Exception:
+            await send_text(instance, phone, "⚠️ Invalid quantity."); return
+        # Lookup case-insensitively; refuse to silently INSERT (use ADD STOCK
+        # for that) so a typo doesn't quietly create a parallel row.
+        existing = await db.fetchrow(
+            "SELECT id, item_name, unit FROM hotel_inventory_items "
+            "WHERE hotel_id=$1 AND LOWER(item_name)=LOWER($2)",
+            hid, name,
+        )
+        if not existing:
+            await send_text(instance, phone,
+                f"⚠️ '{name}' not found. Use *ADD STOCK* to create it first."); return
+        await db.update_inventory_item(existing["id"], hid,
+                                       {"current_stock": qty})
+        u = existing.get("unit") or ""
+        await send_text(instance, phone,
+            f"✅ {existing['item_name']}: {qty:g}{u}")
+        return
+
     # BROADCAST <msg>
     m = re.match(r"^BROADCAST\s+(.+)$", text, re.DOTALL | re.IGNORECASE)
     if m:
@@ -306,6 +428,13 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
     # ADMIN / HELP
     if UP in ("ADMIN","HELP","COMMANDS","?"):
         role = su.get("role","staff").upper()
+        inv_block = ""
+        if hotel.get("inventory_enabled"):
+            inv_block = (
+                "📦 STOCK / LOW STOCK\n"
+                "➕ ADD STOCK Pillows: 20 pcs min 5\n"
+                "🔄 UPDATE STOCK Pillows 18\n"
+            )
         await send_text(instance, phone,
             f"🏨 *{h_name} — {role} Commands*\n━━━━━━━━━━━━━━━━━━\n\n"
             f"✅ APPROVE <phone>\n❌ REJECT <phone>\n"
@@ -313,6 +442,7 @@ async def handle_staff(phone, text, UP, su, hotel, instance, hid, h_name,
             f"🚪 CHECKOUT R<room>\n📄 BILL R<room>\n🔓 FREE R<room>\n"
             f"📊 STATUS R<room>\n🏨 ROOMS\n💰 SALES\n📱 QR R<room>\n"
             f"🚫 BLOCK <phone>\n✅ UNBLOCK <phone>\n"
+            f"{inv_block}"
             f"📢 BROADCAST <message>\n✓ DONE <SR_ID>\n"
             f"🍽️ FOOD DONE R<room> (mark food orders delivered)\n"
             f"📅 EXTEND CONFIRM <bkid> <date>\n"
